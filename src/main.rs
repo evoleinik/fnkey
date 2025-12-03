@@ -246,6 +246,7 @@ unsafe fn create_status_item() {
     let quit_key = NSString::alloc(nil).init_str("q");
     let quit_item: id = msg_send![class!(NSMenuItem), alloc];
     let quit_item: id = msg_send![quit_item, initWithTitle: quit_title action: sel!(terminate:) keyEquivalent: quit_key];
+    let _: () = msg_send![quit_item, setTarget: NSApp()];
     let _: () = msg_send![menu, addItem: quit_item];
 
     let _: () = msg_send![status_item, setMenu: menu];
@@ -328,7 +329,9 @@ fn run_event_tap(state: Arc<AppState>) {
         }
     });
 
-    CFRunLoop::run_current();
+    unsafe {
+        NSApp().run();
+    }
 }
 
 fn start_recording(state: &Arc<AppState>) {
