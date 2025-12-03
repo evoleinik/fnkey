@@ -334,14 +334,7 @@ fn run_event_tap(state: Arc<AppState>) {
     }
 }
 
-fn start_recording(state: &Arc<AppState>) {
-    // Clear buffer
-    {
-        let mut buffer = state.audio_buffer.lock().unwrap();
-        buffer.clear();
-    }
-
-    // Start audio capture
+fn init_audio_stream(state: &Arc<AppState>) {
     let host = cpal::default_host();
     let device = match host.default_input_device() {
         Some(d) => d,
@@ -367,13 +360,27 @@ fn start_recording(state: &Arc<AppState>) {
         )
         .ok();
 
-    if let Some(ref s) = stream {
-        let _ = s.play();
-    }
-
-    // Store stream to keep it alive (unsafe because Stream is not Sync)
+    // Store stream but don't start it yet (keeps mic indicator off)
     unsafe {
         AUDIO_STREAM = stream;
+    }
+}
+
+fn start_recording(state: &Arc<AppState>) {
+    // Clear buffer
+    {
+        let mut buffer = state.audio_buffer.lock().unwrap();
+        buffer.clear();
+    }
+
+    // Create stream on first use, reuse on subsequent uses
+    unsafe {
+        if AUDIO_STREAM.is_none() {
+            init_audio_stream(state);
+        }
+        if let Some(ref s) = AUDIO_STREAM {
+            let _ = s.play();
+        }
     }
 
     update_status_icon(true);
@@ -391,16 +398,11 @@ fn stop_recording(state: &Arc<AppState>) {
     // Small delay to let final audio data arrive
     thread::sleep(Duration::from_millis(50));
 
-    // Get audio buffer BEFORE dropping stream
+    // Get audio buffer
     let audio_data: Vec<f32> = {
         let buffer = state.audio_buffer.lock().unwrap();
         buffer.clone()
     };
-
-    // Now drop the stream (releases microphone)
-    unsafe {
-        AUDIO_STREAM = None;
-    }
 
     update_status_icon(false);
     show_indicator(false);
