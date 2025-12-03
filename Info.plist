@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>ai.fnkey.app</string>
+    <key>CFBundleName</key>
+    <string>FnKey</string>
+    <key>CFBundleDisplayName</key>
+    <string>FnKey</string>
+    <key>CFBundleExecutable</key>
+    <string>fnkey</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>FnKey needs microphone access to record your voice for transcription.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>FnKey needs automation access to paste transcribed text.</string>
+</dict>
+</plist>

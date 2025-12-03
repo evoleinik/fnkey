@@ -1,0 +1,26 @@
+[package]
+name = "fnkey"
+version = "0.1.0"
+edition = "2021"
+description = "Hold Fn key, speak, paste transcribed text"
+license = "GPL-3.0"
+repository = "https://github.com/evoleinik/fnkey"
+
+[dependencies]
+# macOS bindings
+cocoa = "0.26"
+objc = "0.2"
+core-foundation = "0.10"
+core-graphics = "0.24"
+
+# Audio
+cpal = "0.15"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["blocking", "multipart"] }
+
+# Clipboard
+arboard = "3.4"
+
+# Audio encoding
+hound = "3.5"
