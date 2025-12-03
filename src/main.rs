@@ -4,11 +4,12 @@
 //!   export GROQ_API_KEY="your-key"
 //!   open FnKey.app
 
+use std::collections::HashMap;
 use std::env;
+use std::ffi::c_void;
 use std::io::Cursor;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -21,13 +22,121 @@ use cocoa::base::{id, nil, NO};
 use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
-    CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType,
 };
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 use hound::{WavSpec, WavWriter};
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
+
+// ============================================================================
+// Keyboard layout detection (for non-Latin layouts like Russian)
+// ============================================================================
+
+/// Cached keycode map - built once on first access
+static KEYCODE_MAP: OnceLock<HashMap<char, u16>> = OnceLock::new();
+
+/// Opaque type for keyboard layout data structure
+#[repr(C)]
+struct UCKeyboardLayout {
+    _opaque: [u8; 0],
+}
+
+// FFI declarations for Carbon/CoreServices APIs
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn TISCopyCurrentASCIICapableKeyboardLayoutInputSource() -> *const c_void;
+    fn TISGetInputSourceProperty(input_source: *const c_void, property_key: *const c_void) -> *const c_void;
+    fn LMGetKbdType() -> u32;
+    static kTISPropertyUnicodeKeyLayoutData: *const c_void;
+}
+
+#[link(name = "CoreServices", kind = "framework")]
+extern "C" {
+    fn UCKeyTranslate(
+        key_layout_ptr: *const UCKeyboardLayout,
+        virtual_key_code: u16,
+        key_action: u16,
+        modifier_key_state: u32,
+        keyboard_type: u32,
+        key_translate_options: u32,
+        dead_key_state: *mut u32,
+        max_string_length: usize,
+        actual_string_length: *mut usize,
+        unicode_string: *mut u16,
+    ) -> i32;
+}
+
+const KUC_KEY_ACTION_DISPLAY: u16 = 3;
+const QWERTY_V_KEYCODE: u16 = 9;
+
+/// Build a lookup table mapping lowercase characters to their keycodes
+fn build_char_to_keycode_map() -> HashMap<char, u16> {
+    let mut map = HashMap::new();
+
+    unsafe {
+        let input_source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource();
+        if input_source.is_null() {
+            return map;
+        }
+
+        let layout_data_ref = TISGetInputSourceProperty(input_source, kTISPropertyUnicodeKeyLayoutData);
+        if layout_data_ref.is_null() {
+            core_foundation::base::CFRelease(input_source);
+            return map;
+        }
+
+        // Get the layout data bytes
+        let layout_data: core_foundation::data::CFData =
+            core_foundation::base::TCFType::wrap_under_get_rule(layout_data_ref as *const _);
+        let layout_ptr = layout_data.bytes().as_ptr() as *const UCKeyboardLayout;
+        let kbd_type = LMGetKbdType();
+
+        // Iterate through keycodes 0-127 to build reverse lookup
+        for keycode in 0u16..128 {
+            let mut dead_key_state: u32 = 0;
+            let mut char_buf: [u16; 4] = [0; 4];
+            let mut actual_len: usize = 0;
+
+            let result = UCKeyTranslate(
+                layout_ptr,
+                keycode,
+                KUC_KEY_ACTION_DISPLAY,
+                0,
+                kbd_type,
+                0,
+                &mut dead_key_state,
+                char_buf.len(),
+                &mut actual_len,
+                char_buf.as_mut_ptr(),
+            );
+
+            if result == 0 && actual_len == 1 {
+                if let Some(ch) = char::from_u32(u32::from(char_buf[0])) {
+                    map.entry(ch.to_ascii_lowercase()).or_insert(keycode);
+                }
+            }
+        }
+
+        core_foundation::base::CFRelease(input_source);
+    }
+
+    map
+}
+
+/// Get the keycode for 'v' in the current keyboard layout.
+/// Falls back to QWERTY keycode (9) if lookup fails.
+fn get_paste_keycode() -> u16 {
+    let map = KEYCODE_MAP.get_or_init(build_char_to_keycode_map);
+    map.get(&'v').copied().unwrap_or(QWERTY_V_KEYCODE)
+}
+
+// ============================================================================
+// Main application
+// ============================================================================
 
 // Fn key flag in CGEventFlags
 const FN_KEY_FLAG: u64 = 0x800000;
@@ -337,15 +446,29 @@ fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str) {
                 if !text.is_empty() {
                     if let Ok(mut clipboard) = Clipboard::new() {
                         if clipboard.set_text(text).is_ok() {
-                            let _ = Command::new("osascript")
-                                .args([
-                                    "-e",
-                                    r#"tell application "System Events" to keystroke "v" using command down"#,
-                                ])
-                                .output();
+                            paste_with_cgevent();
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+fn paste_with_cgevent() {
+    if let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
+        // Get layout-aware keycode for 'v' (works with Dvorak, Colemak, Russian, etc.)
+        let v_keycode = get_paste_keycode();
+
+        if let Ok(key_down) = CGEvent::new_keyboard_event(source.clone(), v_keycode, true) {
+            if let Ok(key_up) = CGEvent::new_keyboard_event(source, v_keycode, false) {
+                // Add Command modifier
+                key_down.set_flags(CGEventFlags::CGEventFlagCommand);
+                key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+
+                // Post events
+                key_down.post(CGEventTapLocation::HID);
+                key_up.post(CGEventTapLocation::HID);
             }
         }
     }
