@@ -21,10 +21,15 @@ Hold Fn key, speak, paste transcribed text.
    open /Applications/FnKey.app
    ```
 
-4. Grant permissions when prompted:
-   - **Input Monitoring** - for Fn key detection
-   - **Microphone** - for voice recording
-   - **Accessibility** - for pasting text (via System Events)
+4. Grant permissions in **System Settings → Privacy & Security**:
+
+   | Permission | Purpose | How to Grant |
+   |------------|---------|--------------|
+   | **Input Monitoring** | Detect Fn key press | Add FnKey.app via + button |
+   | **Microphone** | Record voice | Prompted on first use, or add manually |
+   | **Accessibility** | Auto-paste text | Add FnKey.app via + button |
+
+   Note: After rebuilding the app, you may need to remove and re-add it in these settings.
 
 ## Usage
 

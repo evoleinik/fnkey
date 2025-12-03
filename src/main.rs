@@ -24,6 +24,7 @@ use core_graphics::event::{
     CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::Stream;
 use hound::{WavSpec, WavWriter};
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
@@ -34,8 +35,7 @@ const FN_KEY_FLAG: u64 = 0x800000;
 const OPTION_KEY_FLAG: u64 = 0x80000;
 
 struct AppState {
-    is_recording: AtomicBool,
-    audio_buffer: Mutex<Vec<f32>>,
+    audio_buffer: Arc<Mutex<Vec<f32>>>,
     api_key: String,
     use_fn_key: AtomicBool,
     sample_rate: u32,
@@ -43,6 +43,8 @@ struct AppState {
 
 // Global status item pointer for updating from callbacks
 static mut STATUS_ITEM: *mut Object = std::ptr::null_mut();
+// Global audio stream (not Send, so can't be in Arc)
+static mut AUDIO_STREAM: Option<Stream> = None;
 
 fn main() {
     let api_key = env::var("GROQ_API_KEY").unwrap_or_else(|_| {
@@ -56,8 +58,7 @@ fn main() {
     }
 
     let state = Arc::new(AppState {
-        is_recording: AtomicBool::new(false),
-        audio_buffer: Mutex::new(Vec::new()),
+        audio_buffer: Arc::new(Mutex::new(Vec::new())),
         api_key,
         use_fn_key: AtomicBool::new(true),
         sample_rate: 16000,
@@ -73,15 +74,8 @@ fn main() {
         create_status_item();
     }
 
-    // Start audio input thread
-    let state_audio = Arc::clone(&state);
-    thread::spawn(move || {
-        run_audio_capture(state_audio);
-    });
-
     // Start event tap for key detection
-    let state_events = Arc::clone(&state);
-    run_event_tap(state_events);
+    run_event_tap(state);
 }
 
 fn check_input_monitoring_permission() -> bool {
@@ -160,41 +154,6 @@ fn update_status_icon(recording: bool) {
     }
 }
 
-fn run_audio_capture(state: Arc<AppState>) {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .expect("No input device available");
-
-    let config = cpal::StreamConfig {
-        channels: 1,
-        sample_rate: cpal::SampleRate(state.sample_rate),
-        buffer_size: cpal::BufferSize::Default,
-    };
-
-    let state_clone = Arc::clone(&state);
-    let stream = device
-        .build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if state_clone.is_recording.load(Ordering::SeqCst) {
-                    let mut buffer = state_clone.audio_buffer.lock().unwrap();
-                    buffer.extend_from_slice(data);
-                }
-            },
-            |err| eprintln!("Audio error: {}", err),
-            None,
-        )
-        .expect("Failed to build input stream");
-
-    stream.play().expect("Failed to start audio stream");
-
-    // Keep thread alive
-    loop {
-        thread::sleep(Duration::from_secs(1));
-    }
-}
-
 fn run_event_tap(state: Arc<AppState>) {
     let state_for_callback = Arc::clone(&state);
     let fn_detected = Arc::new(AtomicBool::new(false));
@@ -270,21 +229,69 @@ fn start_recording(state: &Arc<AppState>) {
         buffer.clear();
     }
 
-    state.is_recording.store(true, Ordering::SeqCst);
+    // Start audio capture
+    let host = cpal::default_host();
+    let device = match host.default_input_device() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let config = cpal::StreamConfig {
+        channels: 1,
+        sample_rate: cpal::SampleRate(state.sample_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let buffer = Arc::clone(&state.audio_buffer);
+    let stream = device
+        .build_input_stream(
+            &config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let mut buf = buffer.lock().unwrap();
+                buf.extend_from_slice(data);
+            },
+            |err| eprintln!("Audio error: {}", err),
+            None,
+        )
+        .ok();
+
+    if let Some(ref s) = stream {
+        let _ = s.play();
+    }
+
+    // Store stream to keep it alive (unsafe because Stream is not Sync)
+    unsafe {
+        AUDIO_STREAM = stream;
+    }
+
     update_status_icon(true);
     show_indicator(true);
 }
 
 fn stop_recording(state: &Arc<AppState>) {
-    state.is_recording.store(false, Ordering::SeqCst);
-    update_status_icon(false);
-    show_indicator(false);
+    // Pause the stream first (keeps data)
+    unsafe {
+        if let Some(ref s) = AUDIO_STREAM {
+            let _ = s.pause();
+        }
+    }
 
-    // Get audio buffer
+    // Small delay to let final audio data arrive
+    thread::sleep(Duration::from_millis(50));
+
+    // Get audio buffer BEFORE dropping stream
     let audio_data: Vec<f32> = {
         let buffer = state.audio_buffer.lock().unwrap();
         buffer.clone()
     };
+
+    // Now drop the stream (releases microphone)
+    unsafe {
+        AUDIO_STREAM = None;
+    }
+
+    update_status_icon(false);
+    show_indicator(false);
 
     if audio_data.is_empty() {
         return;
@@ -299,13 +306,11 @@ fn stop_recording(state: &Arc<AppState>) {
 }
 
 fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str) {
-    // Convert to WAV
     let wav_data = match encode_wav(&audio, sample_rate) {
         Ok(data) => data,
         Err(_) => return,
     };
 
-    // Send to Groq API
     let client = reqwest::blocking::Client::new();
     let form = reqwest::blocking::multipart::Form::new()
         .text("model", "whisper-large-v3-turbo")
@@ -330,7 +335,6 @@ fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str) {
             if let Ok(text) = resp.text() {
                 let text = text.trim();
                 if !text.is_empty() {
-                    // Copy to clipboard and paste
                     if let Ok(mut clipboard) = Clipboard::new() {
                         if clipboard.set_text(text).is_ok() {
                             let _ = Command::new("osascript")
