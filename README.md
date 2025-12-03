@@ -51,3 +51,7 @@ cargo build --release
 - Uses Groq Whisper API (whisper-large-v3-turbo)
 - Falls back to Option key if Fn not detected after 5s
 - Floating red dot appears during recording
+
+## Known Limitations
+
+**Slight recording delay**: There's a brief moment when you start speaking before audio capture begins. This is a deliberate tradeoff — eliminating this delay would require the microphone to be always active, showing the yellow indicator constantly. The current design prioritizes privacy: the microphone only activates when you press the Fn key.
