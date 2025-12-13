@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            arch: aarch64
+            name: arm64
+          - os: macos-13
+            arch: x86_64
+            name: x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.arch }}-apple-darwin
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.arch }}-apple-darwin
+
+      - name: Create app bundle
+        run: |
+          APP_NAME="FnKey"
+          BUNDLE_DIR="$APP_NAME.app"
+
+          rm -rf "$BUNDLE_DIR"
+          mkdir -p "$BUNDLE_DIR/Contents/MacOS"
+          mkdir -p "$BUNDLE_DIR/Contents/Resources"
+
+          cp target/${{ matrix.arch }}-apple-darwin/release/fnkey "$BUNDLE_DIR/Contents/MacOS/"
+          cp Info.plist "$BUNDLE_DIR/Contents/"
+
+          codesign --force --deep --sign - "$BUNDLE_DIR"
+
+      - name: Create zip
+        run: |
+          zip -r FnKey-${{ matrix.name }}.zip FnKey.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FnKey-${{ matrix.name }}
+          path: FnKey-${{ matrix.name }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            FnKey-arm64/FnKey-arm64.zip
+            FnKey-x64/FnKey-x64.zip
+          generate_release_notes: true

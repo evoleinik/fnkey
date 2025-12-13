@@ -4,25 +4,29 @@ Hold Fn key, speak, paste transcribed text.
 
 ## Install
 
-1. Set your Groq API key:
+1. Download from [Releases](https://github.com/evoleinik/fnkey/releases):
+   - **Apple Silicon** (M1/M2/M3): `FnKey-arm64.zip`
+   - **Intel**: `FnKey-x64.zip`
+
+2. Unzip and move to Applications:
+   ```bash
+   unzip FnKey-arm64.zip
+   mv FnKey.app /Applications/
+   ```
+
+3. Set your Groq API key:
    ```bash
    mkdir -p ~/.config/fnkey
    echo 'your-groq-api-key' > ~/.config/fnkey/api_key
    ```
    Get a key at [console.groq.com](https://console.groq.com)
 
-2. Build and install:
-   ```bash
-   ./build-app.sh
-   cp -r FnKey.app /Applications/
-   ```
-
-3. Launch:
+4. Launch:
    ```bash
    open /Applications/FnKey.app
    ```
 
-4. Grant permissions in **System Settings → Privacy & Security**:
+5. Grant permissions in **System Settings → Privacy & Security**:
 
    | Permission | Purpose | How to Grant |
    |------------|---------|--------------|
