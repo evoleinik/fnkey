@@ -6,9 +6,10 @@ Hold Fn key, speak, paste transcribed text.
 
 1. Set your Groq API key:
    ```bash
-   echo 'export GROQ_API_KEY="your-key"' >> ~/.zshrc
-   source ~/.zshrc
+   mkdir -p ~/.config/fnkey
+   echo 'your-groq-api-key' > ~/.config/fnkey/api_key
    ```
+   Get a key at [console.groq.com](https://console.groq.com)
 
 2. Build and install:
    ```bash
@@ -46,9 +47,15 @@ cargo build --release
 ./build-app.sh
 ```
 
+## Features
+
+- **Whisper large-v3** - Full model for best accuracy
+- **Audio enhancement** - DC offset removal, high-pass filter, peak normalization
+- **Config file** - API key stored in `~/.config/fnkey/api_key`
+- **Auto sample rate** - Uses device's native sample rate
+
 ## Notes
 
-- Uses Groq Whisper API (whisper-large-v3-turbo)
 - Falls back to Option key if Fn not detected after 5s
 - Floating red dot appears during recording
 

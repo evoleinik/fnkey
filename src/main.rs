@@ -147,7 +147,7 @@ struct AppState {
     audio_buffer: Arc<Mutex<Vec<f32>>>,
     api_key: String,
     use_fn_key: AtomicBool,
-    sample_rate: u32,
+    sample_rate: std::sync::atomic::AtomicU32,
 }
 
 // Global status item pointer for updating from callbacks
@@ -155,9 +155,32 @@ static mut STATUS_ITEM: *mut Object = std::ptr::null_mut();
 // Global audio stream (not Send, so can't be in Arc)
 static mut AUDIO_STREAM: Option<Stream> = None;
 
+/// Get API key from config file or environment variable.
+/// Checks ~/.config/fnkey/api_key first, then GROQ_API_KEY env var.
+fn get_api_key() -> Option<String> {
+    // Try config file first
+    if let Some(home) = env::var_os("HOME") {
+        let config_path = std::path::Path::new(&home)
+            .join(".config")
+            .join("fnkey")
+            .join("api_key");
+        if let Ok(key) = std::fs::read_to_string(&config_path) {
+            let key = key.trim();
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
+        }
+    }
+    // Fall back to environment variable
+    env::var("GROQ_API_KEY").ok()
+}
+
 fn main() {
-    let api_key = env::var("GROQ_API_KEY").unwrap_or_else(|_| {
-        show_alert("GROQ_API_KEY not set", "Please set GROQ_API_KEY environment variable before running FnKey.");
+    let api_key = get_api_key().unwrap_or_else(|| {
+        show_alert(
+            "GROQ_API_KEY not configured",
+            "Please create ~/.config/fnkey/api_key with your Groq API key.\n\nExample:\n  mkdir -p ~/.config/fnkey\n  echo 'gsk_your_key_here' > ~/.config/fnkey/api_key"
+        );
         std::process::exit(1);
     });
 
@@ -170,7 +193,7 @@ fn main() {
         audio_buffer: Arc::new(Mutex::new(Vec::new())),
         api_key,
         use_fn_key: AtomicBool::new(true),
-        sample_rate: 16000,
+        sample_rate: std::sync::atomic::AtomicU32::new(48000), // Default, will be updated
     });
 
     // Initialize NSApplication
@@ -341,9 +364,18 @@ fn init_audio_stream(state: &Arc<AppState>) {
         None => return,
     };
 
+    // Use device's default config instead of hardcoded 16kHz
+    let supported_config = match device.default_input_config() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let actual_sample_rate = supported_config.sample_rate().0;
+    state.sample_rate.store(actual_sample_rate, Ordering::SeqCst);
+
     let config = cpal::StreamConfig {
-        channels: 1,
-        sample_rate: cpal::SampleRate(state.sample_rate),
+        channels: 1,  // Force mono
+        sample_rate: supported_config.sample_rate(),
         buffer_size: cpal::BufferSize::Default,
     };
 
@@ -413,7 +445,7 @@ fn stop_recording(state: &Arc<AppState>) {
 
     // Transcribe in background
     let api_key = state.api_key.clone();
-    let sample_rate = state.sample_rate;
+    let sample_rate = state.sample_rate.load(Ordering::SeqCst);
     thread::spawn(move || {
         transcribe_and_paste(audio_data, sample_rate, &api_key);
     });
@@ -427,7 +459,7 @@ fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str) {
 
     let client = reqwest::blocking::Client::new();
     let form = reqwest::blocking::multipart::Form::new()
-        .text("model", "whisper-large-v3-turbo")
+        .text("model", "whisper-large-v3")  // Full model for better accuracy (vs turbo)
         .text("response_format", "text")
         .part(
             "file",
@@ -479,7 +511,53 @@ fn paste_with_cgevent() {
     }
 }
 
+/// Enhance audio quality before transcription.
+/// Ported from Ito's audio preprocessing pipeline.
+/// - Removes DC offset
+/// - Applies high-pass filter (~80 Hz) to remove rumble
+/// - Peak normalizes to ~-3 dBFS with capped gain
+fn enhance_audio(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    // 1. DC offset removal
+    let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
+    let dc_removed: Vec<f32> = samples.iter().map(|&s| s - mean).collect();
+
+    // 2. High-pass filter (~80 Hz) - first-order filter
+    let fc = 80.0_f32;
+    let a = (-2.0 * std::f32::consts::PI * fc / sample_rate as f32).exp();
+
+    let mut filtered = Vec::with_capacity(dc_removed.len());
+    let mut prev_x = 0.0_f32;
+    let mut prev_y = 0.0_f32;
+
+    for &x in &dc_removed {
+        let y = a * (prev_y + x - prev_x);
+        filtered.push(y);
+        prev_x = x;
+        prev_y = y;
+    }
+
+    // 3. Peak normalization to ~-3 dBFS, cap max gain to +12 dB
+    let peak = filtered.iter().map(|&s| s.abs()).fold(1.0_f32, f32::max);
+    let target = 0.707_f32; // ~-3 dBFS (0.707 ≈ 10^(-3/20))
+    let raw_gain = target / peak;
+    let gain = raw_gain.min(4.0); // Cap at ~+12 dB
+
+    // Apply gain only if it would make a meaningful difference
+    if gain > 1.05 {
+        filtered.iter().map(|&s| (s * gain).clamp(-1.0, 1.0)).collect()
+    } else {
+        filtered.iter().map(|&s| s.clamp(-1.0, 1.0)).collect()
+    }
+}
+
 fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, hound::Error> {
+    // Enhance audio before encoding
+    let enhanced = enhance_audio(samples, sample_rate);
+
     let spec = WavSpec {
         channels: 1,
         sample_rate,
@@ -490,7 +568,7 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, hound::Error
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut writer = WavWriter::new(&mut cursor, spec)?;
-        for &sample in samples {
+        for &sample in &enhanced {
             let sample_i16 = (sample * 32767.0) as i16;
             writer.write_sample(sample_i16)?;
         }
