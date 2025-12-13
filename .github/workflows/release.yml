@@ -10,17 +10,7 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - os: macos-14
-            arch: aarch64
-            name: arm64
-          - os: macos-13
-            arch: x86_64
-            name: x64
-
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-14
 
     steps:
       - uses: actions/checkout@v4
@@ -28,47 +18,39 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.arch }}-apple-darwin
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.arch }}-apple-darwin
+      - name: Build arm64
+        run: cargo build --release --target aarch64-apple-darwin
 
-      - name: Create app bundle
+      - name: Build x64
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Create app bundles
         run: |
-          APP_NAME="FnKey"
-          BUNDLE_DIR="$APP_NAME.app"
+          for arch in aarch64 x86_64; do
+            if [ "$arch" = "aarch64" ]; then
+              name="arm64"
+            else
+              name="x64"
+            fi
 
-          rm -rf "$BUNDLE_DIR"
-          mkdir -p "$BUNDLE_DIR/Contents/MacOS"
-          mkdir -p "$BUNDLE_DIR/Contents/Resources"
+            BUNDLE_DIR="FnKey-$name.app"
+            rm -rf "$BUNDLE_DIR"
+            mkdir -p "$BUNDLE_DIR/Contents/MacOS"
+            mkdir -p "$BUNDLE_DIR/Contents/Resources"
 
-          cp target/${{ matrix.arch }}-apple-darwin/release/fnkey "$BUNDLE_DIR/Contents/MacOS/"
-          cp Info.plist "$BUNDLE_DIR/Contents/"
+            cp target/$arch-apple-darwin/release/fnkey "$BUNDLE_DIR/Contents/MacOS/"
+            cp Info.plist "$BUNDLE_DIR/Contents/"
 
-          codesign --force --deep --sign - "$BUNDLE_DIR"
-
-      - name: Create zip
-        run: |
-          zip -r FnKey-${{ matrix.name }}.zip FnKey.app
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: FnKey-${{ matrix.name }}
-          path: FnKey-${{ matrix.name }}.zip
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+            codesign --force --deep --sign - "$BUNDLE_DIR"
+            zip -r "FnKey-$name.zip" "$BUNDLE_DIR"
+          done
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            FnKey-arm64/FnKey-arm64.zip
-            FnKey-x64/FnKey-x64.zip
+            FnKey-arm64.zip
+            FnKey-x64.zip
           generate_release_notes: true
