@@ -609,14 +609,14 @@ fn show_indicator(show: bool) {
                 window.setLevel_(25);
                 window.setOpaque_(NO);
                 window.setBackgroundColor_(NSColor::clearColor(nil));
-                window.setIgnoresMouseEvents_(true);
+                window.setIgnoresMouseEvents_(YES);
 
                 // Create red circle view
                 let view: id = NSView::alloc(nil).initWithFrame_(NSRect::new(
                     NSPoint::new(0.0, 0.0),
                     NSSize::new(window_size, window_size),
                 ));
-                view.setWantsLayer(true);
+                view.setWantsLayer(YES);
                 let layer: id = msg_send![view, layer];
                 let red: id = NSColor::colorWithRed_green_blue_alpha_(nil, 1.0, 0.2, 0.2, 1.0);
                 let cg_color: id = msg_send![red, CGColor];
