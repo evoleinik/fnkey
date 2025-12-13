@@ -54,6 +54,14 @@ cargo build --release
 - **Config file** - API key stored in `~/.config/fnkey/api_key`
 - **Auto sample rate** - Uses device's native sample rate
 
+## TODO
+
+Features from Ito not yet implemented:
+
+- **Vocabulary hints** - Send prompt with proper nouns/technical terms to improve accuracy
+- **No-speech detection** - Use `verbose_json` response format and check `no_speech_prob` to skip silent recordings
+- **Custom dictionary** - User-configurable word list for domain-specific terms
+
 ## Notes
 
 - Falls back to Option key if Fn not detected after 5s
