@@ -18,7 +18,7 @@ use cocoa::appkit::{
     NSApp, NSApplication, NSApplicationActivationPolicyAccessory, NSBackingStoreBuffered,
     NSColor, NSMenu, NSView, NSWindow, NSWindowStyleMask,
 };
-use cocoa::base::{id, nil, NO};
+use cocoa::base::{id, nil, NO, YES};
 use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
