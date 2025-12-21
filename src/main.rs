@@ -14,12 +14,9 @@ use std::thread;
 use std::time::Duration;
 
 use arboard::Clipboard;
-use cocoa::appkit::{
-    NSApp, NSApplication, NSApplicationActivationPolicyAccessory, NSBackingStoreBuffered,
-    NSColor, NSMenu, NSView, NSWindow, NSWindowStyleMask,
-};
-use cocoa::base::{id, nil, NO, YES};
-use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
+use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyAccessory, NSMenu};
+use cocoa::base::{id, nil};
+use cocoa::foundation::{NSAutoreleasePool, NSString};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -416,7 +413,6 @@ fn start_recording(state: &Arc<AppState>) {
     }
 
     update_status_icon(true);
-    show_indicator(true);
 }
 
 fn stop_recording(state: &Arc<AppState>) {
@@ -437,7 +433,6 @@ fn stop_recording(state: &Arc<AppState>) {
     };
 
     update_status_icon(false);
-    show_indicator(false);
 
     if audio_data.is_empty() {
         return;
@@ -576,60 +571,4 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, hound::Error
     }
 
     Ok(cursor.into_inner())
-}
-
-fn show_indicator(show: bool) {
-    unsafe {
-        let _pool = NSAutoreleasePool::new(nil);
-
-        static mut WINDOW: *mut Object = std::ptr::null_mut();
-
-        if show {
-            if WINDOW.is_null() {
-                // Create window
-                let screen_frame: NSRect = msg_send![cocoa::appkit::NSScreen::mainScreen(nil), frame];
-                let window_size = 20.0;
-                let margin = 10.0;
-
-                let frame = NSRect::new(
-                    NSPoint::new(
-                        screen_frame.size.width - window_size - margin,
-                        screen_frame.size.height - window_size - margin - 25.0,
-                    ),
-                    NSSize::new(window_size, window_size),
-                );
-
-                let window: id = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
-                    frame,
-                    NSWindowStyleMask::NSBorderlessWindowMask,
-                    NSBackingStoreBuffered,
-                    NO,
-                );
-
-                window.setLevel_(25);
-                window.setOpaque_(NO);
-                window.setBackgroundColor_(NSColor::clearColor(nil));
-                window.setIgnoresMouseEvents_(YES);
-
-                // Create red circle view
-                let view: id = NSView::alloc(nil).initWithFrame_(NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(window_size, window_size),
-                ));
-                view.setWantsLayer(YES);
-                let layer: id = msg_send![view, layer];
-                let red: id = NSColor::colorWithRed_green_blue_alpha_(nil, 1.0, 0.2, 0.2, 1.0);
-                let cg_color: id = msg_send![red, CGColor];
-                let _: () = msg_send![layer, setBackgroundColor: cg_color];
-                let _: () = msg_send![layer, setCornerRadius: window_size / 2.0];
-
-                window.setContentView_(view);
-                WINDOW = window as *mut Object;
-            }
-
-            let _: () = msg_send![WINDOW as id, orderFront: nil];
-        } else if !WINDOW.is_null() {
-            let _: () = msg_send![WINDOW as id, orderOut: nil];
-        }
-    }
 }
