@@ -18,8 +18,8 @@ mkdir -p "$BUNDLE_DIR/Contents/Resources"
 cp target/release/fnkey "$BUNDLE_DIR/Contents/MacOS/"
 cp Info.plist "$BUNDLE_DIR/Contents/"
 
-echo "Signing app (ad-hoc)..."
-codesign --force --deep --sign - "$BUNDLE_DIR"
+echo "Signing app..."
+codesign --force --deep --sign "FnKey Dev" "$BUNDLE_DIR"
 
 echo "Done! App bundle created at: $BUNDLE_DIR"
 echo ""
