@@ -48,9 +48,11 @@ The icon changes: ○ (idle) → ● (recording)
 ## Build from source
 
 ```bash
-cargo build --release
 ./build-app.sh
+cp -r FnKey.app /Applications/
 ```
+
+Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.sh'`
 
 ## Features
 
