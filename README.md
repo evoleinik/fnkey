@@ -38,7 +38,8 @@ Hold Fn key, speak, paste transcribed text.
 
 ## Usage
 
-- Hold **Fn** key and speak
+- Hold **Fn** and speak → raw transcription
+- Hold **Fn+Ctrl** and speak → polished transcription (removes filler words, improves sentence structure)
 - Release to transcribe and paste
 - Click menu bar icon (○) → Quit to exit
 

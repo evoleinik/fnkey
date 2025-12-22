@@ -139,6 +139,8 @@ fn get_paste_keycode() -> u16 {
 const FN_KEY_FLAG: u64 = 0x800000;
 // Option/Alt key flag
 const OPTION_KEY_FLAG: u64 = 0x80000;
+// Control key flag
+const CONTROL_KEY_FLAG: u64 = 0x40000;
 
 struct AppState {
     audio_buffer: Arc<Mutex<Vec<f32>>>,
@@ -288,9 +290,11 @@ fn run_event_tap(state: Arc<AppState>) {
     let state_for_callback = Arc::clone(&state);
     let fn_detected = Arc::new(AtomicBool::new(false));
     let was_pressed = Arc::new(AtomicBool::new(false));
+    let ctrl_was_held = Arc::new(AtomicBool::new(false));
 
     let fn_detected_clone = Arc::clone(&fn_detected);
     let was_pressed_clone = Arc::clone(&was_pressed);
+    let ctrl_latched_clone = Arc::clone(&ctrl_was_held); // Latches true if Ctrl pressed anytime during recording
 
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -303,6 +307,7 @@ fn run_event_tap(state: Arc<AppState>) {
             // Check Fn key first, then Option as fallback
             let fn_pressed = (flags & FN_KEY_FLAG) != 0;
             let option_pressed = (flags & OPTION_KEY_FLAG) != 0;
+            let ctrl_pressed = (flags & CONTROL_KEY_FLAG) != 0;
 
             let use_fn = state_for_callback.use_fn_key.load(Ordering::SeqCst);
             let key_pressed = if use_fn { fn_pressed } else { option_pressed };
@@ -316,11 +321,18 @@ fn run_event_tap(state: Arc<AppState>) {
 
             // Handle key state changes
             if key_pressed && !prev_pressed {
-                // Key pressed - start recording
+                // Key pressed - start recording, reset Ctrl latch
+                ctrl_latched_clone.store(false, Ordering::SeqCst);
                 start_recording(&state_for_callback);
             } else if !key_pressed && prev_pressed {
                 // Key released - stop recording and transcribe
-                stop_recording(&state_for_callback);
+                let polish = ctrl_latched_clone.load(Ordering::SeqCst);
+                stop_recording(&state_for_callback, polish);
+            }
+
+            // Latch Ctrl if pressed anytime during recording
+            if key_pressed && ctrl_pressed {
+                ctrl_latched_clone.store(true, Ordering::SeqCst);
             }
 
             was_pressed_clone.store(key_pressed, Ordering::SeqCst);
@@ -415,7 +427,7 @@ fn start_recording(state: &Arc<AppState>) {
     update_status_icon(true);
 }
 
-fn stop_recording(state: &Arc<AppState>) {
+fn stop_recording(state: &Arc<AppState>, polish: bool) {
     // Pause the stream first (keeps data)
     unsafe {
         if let Some(ref s) = AUDIO_STREAM {
@@ -442,11 +454,11 @@ fn stop_recording(state: &Arc<AppState>) {
     let api_key = state.api_key.clone();
     let sample_rate = state.sample_rate.load(Ordering::SeqCst);
     thread::spawn(move || {
-        transcribe_and_paste(audio_data, sample_rate, &api_key);
+        transcribe_and_paste(audio_data, sample_rate, &api_key, polish);
     });
 }
 
-fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str) {
+fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str, polish: bool) {
     let wav_data = match encode_wav(&audio, sample_rate) {
         Ok(data) => data,
         Err(_) => return,
@@ -476,8 +488,15 @@ fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str) {
             if let Ok(text) = resp.text() {
                 let text = text.trim();
                 if !text.is_empty() {
+                    // Apply polish if requested, fallback to raw on error
+                    let final_text = if polish {
+                        polish_text(text, api_key).unwrap_or_else(|| text.to_string())
+                    } else {
+                        text.to_string()
+                    };
+
                     if let Ok(mut clipboard) = Clipboard::new() {
-                        if clipboard.set_text(text).is_ok() {
+                        if clipboard.set_text(&final_text).is_ok() {
                             paste_with_cgevent();
                         }
                     }
@@ -504,6 +523,62 @@ fn paste_with_cgevent() {
             }
         }
     }
+}
+
+// ============================================================================
+// LLM Polish (spoken -> written style)
+// ============================================================================
+
+#[derive(serde::Deserialize)]
+struct ChatResponse {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatMessage {
+    content: String,
+}
+
+/// Polish transcribed text using LLM to convert spoken style to written prose.
+/// Returns None on any error (caller should fall back to raw text).
+fn polish_text(text: &str, api_key: &str) -> Option<String> {
+    let client = reqwest::blocking::Client::new();
+
+    let body = serde_json::json!({
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a text cleanup tool. Remove filler words (um, uh, like, you know) and fix punctuation (add commas). No trailing period at the end. Output ONLY the cleaned text, nothing else. No explanations. No quotes. Just the text."
+            },
+            {
+                "role": "user",
+                "content": text
+            }
+        ],
+        "temperature": 0.2
+    });
+
+    let response = client
+        .post("https://api.groq.com/openai/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let chat_response: ChatResponse = response.json().ok()?;
+    chat_response.choices.first().map(|c| c.message.content.clone())
 }
 
 /// Enhance audio quality before transcription.

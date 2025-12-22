@@ -17,10 +17,14 @@ core-graphics = "0.24"
 cpal = "0.15"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["blocking", "multipart"] }
+reqwest = { version = "0.12", features = ["blocking", "multipart", "json"] }
 
 # Clipboard
 arboard = "3.4"
 
 # Audio encoding
 hound = "3.5"
+
+# JSON parsing for LLM API
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

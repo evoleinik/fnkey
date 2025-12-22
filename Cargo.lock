@@ -464,6 +464,8 @@ dependencies = [
  "hound",
  "objc",
  "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
