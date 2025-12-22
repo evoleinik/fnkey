@@ -554,7 +554,7 @@ fn polish_text(text: &str, api_key: &str) -> Option<String> {
         "messages": [
             {
                 "role": "system",
-                "content": "You are a text cleanup tool. Remove filler words (um, uh, like, you know) and fix punctuation (add commas). No trailing period at the end. Output ONLY the cleaned text, nothing else. No explanations. No quotes. Just the text."
+                "content": "Clean up this voice message for texting. Remove filler words (um, uh, like, you know). Fix punctuation and sentence structure. Break up run-on sentences. Keep it casual. No trailing period. Output ONLY the cleaned text - no explanations, no quotes."
             },
             {
                 "role": "user",
