@@ -17,6 +17,9 @@ mkdir -p "$BUNDLE_DIR/Contents/Resources"
 
 cp target/release/fnkey "$BUNDLE_DIR/Contents/MacOS/"
 cp Info.plist "$BUNDLE_DIR/Contents/"
+if [ -f AppIcon.icns ]; then
+    cp AppIcon.icns "$BUNDLE_DIR/Contents/Resources/"
+fi
 
 echo "Signing app..."
 codesign --force --deep --sign "FnKey Dev" "$BUNDLE_DIR"

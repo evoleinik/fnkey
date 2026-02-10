@@ -26,7 +26,8 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 use hound::{WavSpec, WavWriter};
-use objc::runtime::Object;
+use objc::declare::ClassDecl;
+use objc::runtime::{Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 
 // ============================================================================
@@ -135,17 +136,144 @@ fn get_paste_keycode() -> u16 {
 // Main application
 // ============================================================================
 
-// Fn key flag in CGEventFlags
+// Modifier key flags in CGEventFlags
 const FN_KEY_FLAG: u64 = 0x800000;
-// Option/Alt key flag
 const OPTION_KEY_FLAG: u64 = 0x80000;
-// Control key flag
 const CONTROL_KEY_FLAG: u64 = 0x40000;
+const SHIFT_KEY_FLAG: u64 = 0x20000;
+const COMMAND_KEY_FLAG: u64 = 0x100000;
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+fn default_api_key() -> String {
+    String::new()
+}
+fn default_transcription_url() -> String {
+    "https://api.groq.com/openai/v1/audio/transcriptions".to_string()
+}
+fn default_polish_url() -> String {
+    "https://api.groq.com/openai/v1/chat/completions".to_string()
+}
+fn default_whisper_model() -> String {
+    "whisper-large-v3".to_string()
+}
+fn default_polish_model() -> String {
+    "llama-3.3-70b-versatile".to_string()
+}
+fn default_hotkey() -> String {
+    "fn".to_string()
+}
+
+#[derive(serde::Deserialize, Clone)]
+struct Config {
+    #[serde(default = "default_api_key")]
+    api_key: String,
+    #[serde(default = "default_transcription_url")]
+    transcription_url: String,
+    #[serde(default = "default_polish_url")]
+    polish_url: String,
+    #[serde(default = "default_whisper_model")]
+    whisper_model: String,
+    #[serde(default = "default_polish_model")]
+    polish_model: String,
+    #[serde(default = "default_hotkey")]
+    hotkey: String,
+}
+
+impl Config {
+    /// Returns the CGEventFlags bitmask for the configured hotkey
+    fn hotkey_flag(&self) -> u64 {
+        match self.hotkey.as_str() {
+            "option" => OPTION_KEY_FLAG,
+            "control" => CONTROL_KEY_FLAG,
+            "shift" => SHIFT_KEY_FLAG,
+            "command" => COMMAND_KEY_FLAG,
+            _ => FN_KEY_FLAG, // "fn" or any unrecognized value
+        }
+    }
+
+    /// Returns the modifier flag used to trigger polish mode.
+    /// Normally Ctrl, but if hotkey is already Ctrl, use Shift instead.
+    fn polish_flag(&self) -> u64 {
+        if self.hotkey == "control" {
+            SHIFT_KEY_FLAG
+        } else {
+            CONTROL_KEY_FLAG
+        }
+    }
+}
+
+/// Load configuration from TOML file, legacy api_key file, or environment variable.
+/// Always returns a Config — creates a default config.toml if nothing exists.
+fn load_config() -> Config {
+    if let Some(home) = env::var_os("HOME") {
+        let config_dir = std::path::Path::new(&home).join(".config").join("fnkey");
+
+        // Try config.toml first
+        let toml_path = config_dir.join("config.toml");
+        if let Ok(contents) = std::fs::read_to_string(&toml_path) {
+            if let Ok(config) = toml::from_str::<Config>(&contents) {
+                return config;
+            }
+        }
+
+        // Try legacy api_key file
+        let key_path = config_dir.join("api_key");
+        if let Ok(key) = std::fs::read_to_string(&key_path) {
+            let key = key.trim();
+            if !key.is_empty() {
+                return Config {
+                    api_key: key.to_string(),
+                    transcription_url: default_transcription_url(),
+                    polish_url: default_polish_url(),
+                    whisper_model: default_whisper_model(),
+                    polish_model: default_polish_model(),
+                    hotkey: default_hotkey(),
+                };
+            }
+        }
+
+        // Try environment variable
+        if let Ok(key) = env::var("GROQ_API_KEY") {
+            return Config {
+                api_key: key,
+                transcription_url: default_transcription_url(),
+                polish_url: default_polish_url(),
+                whisper_model: default_whisper_model(),
+                polish_model: default_polish_model(),
+                hotkey: default_hotkey(),
+            };
+        }
+
+        // No config found — create a default config.toml for the user to edit
+        let _ = std::fs::create_dir_all(&config_dir);
+        let default_toml = r#"# FnKey configuration — edit and relaunch
+# api_key = "your-api-key"
+# transcription_url = "https://your-server/v1/audio/transcriptions"
+# polish_url = "https://your-server/v1/chat/completions"
+# whisper_model = "whisper-large-v3"
+# polish_model = "llama-3.3-70b-versatile"
+# hotkey = "fn"
+"#;
+        let _ = std::fs::write(&toml_path, default_toml);
+    }
+
+    // Return defaults — app will launch but transcription won't work until configured
+    Config {
+        api_key: default_api_key(),
+        transcription_url: default_transcription_url(),
+        polish_url: default_polish_url(),
+        whisper_model: default_whisper_model(),
+        polish_model: default_polish_model(),
+        hotkey: default_hotkey(),
+    }
+}
 
 struct AppState {
     audio_buffer: Arc<Mutex<Vec<f32>>>,
-    api_key: String,
-    use_fn_key: AtomicBool,
+    config: Config,
     sample_rate: std::sync::atomic::AtomicU32,
 }
 
@@ -154,44 +282,15 @@ static mut STATUS_ITEM: *mut Object = std::ptr::null_mut();
 // Global audio stream (not Send, so can't be in Arc)
 static mut AUDIO_STREAM: Option<Stream> = None;
 
-/// Get API key from config file or environment variable.
-/// Checks ~/.config/fnkey/api_key first, then GROQ_API_KEY env var.
-fn get_api_key() -> Option<String> {
-    // Try config file first
-    if let Some(home) = env::var_os("HOME") {
-        let config_path = std::path::Path::new(&home)
-            .join(".config")
-            .join("fnkey")
-            .join("api_key");
-        if let Ok(key) = std::fs::read_to_string(&config_path) {
-            let key = key.trim();
-            if !key.is_empty() {
-                return Some(key.to_string());
-            }
-        }
-    }
-    // Fall back to environment variable
-    env::var("GROQ_API_KEY").ok()
-}
-
 fn main() {
-    let api_key = get_api_key().unwrap_or_else(|| {
-        show_alert(
-            "GROQ_API_KEY not configured",
-            "Please create ~/.config/fnkey/api_key with your Groq API key.\n\nExample:\n  mkdir -p ~/.config/fnkey\n  echo 'gsk_your_key_here' > ~/.config/fnkey/api_key"
-        );
-        std::process::exit(1);
-    });
+    let config = load_config();
 
-    // Check Input Monitoring permission
-    if !check_input_monitoring_permission() {
-        std::process::exit(1);
-    }
+    // Request Input Monitoring permission (non-blocking — app continues either way)
+    check_input_monitoring_permission();
 
     let state = Arc::new(AppState {
         audio_buffer: Arc::new(Mutex::new(Vec::new())),
-        api_key,
-        use_fn_key: AtomicBool::new(true),
+        config,
         sample_rate: std::sync::atomic::AtomicU32::new(48000), // Default, will be updated
     });
 
@@ -209,29 +308,18 @@ fn main() {
     run_event_tap(state);
 }
 
-fn check_input_monitoring_permission() -> bool {
+fn check_input_monitoring_permission() {
     unsafe {
-        // CGPreflightListenEventAccess and CGRequestListenEventAccess
         #[link(name = "CoreGraphics", kind = "framework")]
         extern "C" {
             fn CGPreflightListenEventAccess() -> bool;
             fn CGRequestListenEventAccess() -> bool;
         }
 
-        if CGPreflightListenEventAccess() {
-            return true;
+        if !CGPreflightListenEventAccess() {
+            // Request permission - shows system dialog on first run
+            CGRequestListenEventAccess();
         }
-
-        // Request permission - this shows system dialog
-        if CGRequestListenEventAccess() {
-            return true;
-        }
-
-        show_alert(
-            "Input Monitoring Required",
-            "FnKey needs Input Monitoring permission to detect the Fn key.\n\nPlease grant access in System Settings → Privacy & Security → Input Monitoring, then relaunch FnKey.",
-        );
-        false
     }
 }
 
@@ -249,6 +337,49 @@ fn show_alert(title: &str, message: &str) {
     }
 }
 
+/// Objective-C callback: open config.toml in default editor
+extern "C" fn open_settings(_this: &Object, _cmd: Sel, _sender: id) {
+    if let Some(home) = env::var_os("HOME") {
+        let config_path = std::path::Path::new(&home)
+            .join(".config")
+            .join("fnkey")
+            .join("config.toml");
+        // Ensure file exists
+        let _ = std::fs::create_dir_all(config_path.parent().unwrap());
+        if !config_path.exists() {
+            let default_toml = r#"# FnKey configuration — edit and relaunch
+# api_key = "your-api-key"
+# transcription_url = "https://your-server/v1/audio/transcriptions"
+# polish_url = "https://your-server/v1/chat/completions"
+# whisper_model = "whisper-large-v3"
+# polish_model = "llama-3.3-70b-versatile"
+# hotkey = "fn"
+"#;
+            let _ = std::fs::write(&config_path, default_toml);
+        }
+        unsafe {
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let path_str = NSString::alloc(nil).init_str(config_path.to_str().unwrap());
+            let url: id = msg_send![class!(NSURL), fileURLWithPath: path_str];
+            let _: bool = msg_send![workspace, openURL: url];
+        }
+    }
+}
+
+/// Register a helper class with an openSettings: action
+unsafe fn register_menu_delegate() -> id {
+    let superclass = class!(NSObject);
+    let mut decl = ClassDecl::new("FnKeyMenuDelegate", superclass).unwrap();
+    decl.add_method(
+        sel!(openSettings:),
+        open_settings as extern "C" fn(&Object, Sel, id),
+    );
+    let cls = decl.register();
+    let obj: id = msg_send![cls, new];
+    let _: () = msg_send![obj, retain];
+    obj
+}
+
 unsafe fn create_status_item() {
     let status_bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
     let status_item: id = msg_send![status_bar, statusItemWithLength: -1.0_f64]; // NSVariableStatusItemLength
@@ -260,8 +391,23 @@ unsafe fn create_status_item() {
     let button: id = msg_send![status_item, button];
     let _: () = msg_send![button, setTitle: title];
 
+    // Register menu delegate for Settings action
+    let delegate = register_menu_delegate();
+
     // Create menu
     let menu: id = NSMenu::new(nil);
+
+    // Settings item
+    let settings_title = NSString::alloc(nil).init_str("Settings...");
+    let settings_key = NSString::alloc(nil).init_str(",");
+    let settings_item: id = msg_send![class!(NSMenuItem), alloc];
+    let settings_item: id = msg_send![settings_item, initWithTitle: settings_title action: sel!(openSettings:) keyEquivalent: settings_key];
+    let _: () = msg_send![settings_item, setTarget: delegate];
+    let _: () = msg_send![menu, addItem: settings_item];
+
+    // Separator
+    let separator: id = msg_send![class!(NSMenuItem), separatorItem];
+    let _: () = msg_send![menu, addItem: separator];
 
     // Quit item
     let quit_title = NSString::alloc(nil).init_str("Quit FnKey");
@@ -288,13 +434,14 @@ fn update_status_icon(recording: bool) {
 
 fn run_event_tap(state: Arc<AppState>) {
     let state_for_callback = Arc::clone(&state);
-    let fn_detected = Arc::new(AtomicBool::new(false));
     let was_pressed = Arc::new(AtomicBool::new(false));
-    let ctrl_was_held = Arc::new(AtomicBool::new(false));
+    let polish_latched = Arc::new(AtomicBool::new(false));
 
-    let fn_detected_clone = Arc::clone(&fn_detected);
     let was_pressed_clone = Arc::clone(&was_pressed);
-    let ctrl_latched_clone = Arc::clone(&ctrl_was_held); // Latches true if Ctrl pressed anytime during recording
+    let polish_latched_clone = Arc::clone(&polish_latched);
+
+    let hotkey_flag = state.config.hotkey_flag();
+    let polish_flag = state.config.polish_flag();
 
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -304,65 +451,54 @@ fn run_event_tap(state: Arc<AppState>) {
         move |_, _, event| {
             let flags = event.get_flags().bits();
 
-            // Check Fn key first, then Option as fallback
-            let fn_pressed = (flags & FN_KEY_FLAG) != 0;
-            let option_pressed = (flags & OPTION_KEY_FLAG) != 0;
-            let ctrl_pressed = (flags & CONTROL_KEY_FLAG) != 0;
-
-            let use_fn = state_for_callback.use_fn_key.load(Ordering::SeqCst);
-            let key_pressed = if use_fn { fn_pressed } else { option_pressed };
-
-            // Detect if Fn key works (first time detection)
-            if fn_pressed && !fn_detected_clone.load(Ordering::SeqCst) {
-                fn_detected_clone.store(true, Ordering::SeqCst);
-            }
+            let key_pressed = (flags & hotkey_flag) != 0;
+            let polish_held = (flags & polish_flag) != 0;
 
             let prev_pressed = was_pressed_clone.load(Ordering::SeqCst);
 
-            // Handle key state changes
             if key_pressed && !prev_pressed {
-                // Key pressed - start recording, reset Ctrl latch
-                ctrl_latched_clone.store(false, Ordering::SeqCst);
+                // Key pressed - start recording, reset polish latch
+                polish_latched_clone.store(false, Ordering::SeqCst);
                 start_recording(&state_for_callback);
             } else if !key_pressed && prev_pressed {
                 // Key released - stop recording and transcribe
-                let polish = ctrl_latched_clone.load(Ordering::SeqCst);
+                let polish = polish_latched_clone.load(Ordering::SeqCst);
                 stop_recording(&state_for_callback, polish);
             }
 
-            // Latch Ctrl if pressed anytime during recording
-            if key_pressed && ctrl_pressed {
-                ctrl_latched_clone.store(true, Ordering::SeqCst);
+            // Latch polish modifier if held anytime during recording
+            if key_pressed && polish_held {
+                polish_latched_clone.store(true, Ordering::SeqCst);
             }
 
             was_pressed_clone.store(key_pressed, Ordering::SeqCst);
             None
         },
-    )
-    .expect("Failed to create event tap - check Input Monitoring permissions");
+    );
 
-    let source = tap
-        .mach_port
-        .create_runloop_source(0)
-        .expect("Failed to create runloop source");
+    match tap {
+        Ok(tap) => {
+            let source = tap
+                .mach_port
+                .create_runloop_source(0)
+                .expect("Failed to create runloop source");
 
-    let run_loop = CFRunLoop::get_current();
-    run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
+            let run_loop = CFRunLoop::get_current();
+            run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
 
-    tap.enable();
+            tap.enable();
 
-    // Fallback timer: if no Fn detected in 5 seconds, switch to Option
-    let state_fallback = Arc::clone(&state);
-    let fn_detected_fallback = Arc::clone(&fn_detected);
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(5));
-        if !fn_detected_fallback.load(Ordering::SeqCst) && state_fallback.use_fn_key.load(Ordering::SeqCst) {
-            state_fallback.use_fn_key.store(false, Ordering::SeqCst);
+            // tap + source must stay alive while the run loop is running
+            unsafe { NSApp().run(); }
         }
-    });
-
-    unsafe {
-        NSApp().run();
+        Err(_) => {
+            show_alert(
+                "Input Monitoring Required",
+                "FnKey can't detect hotkey presses.\n\nGo to System Settings → Privacy & Security → Input Monitoring, remove FnKey, re-add it, then relaunch.",
+            );
+            // Still run the app so the menu bar icon (Settings/Quit) is usable
+            unsafe { NSApp().run(); }
+        }
     }
 }
 
@@ -451,14 +587,14 @@ fn stop_recording(state: &Arc<AppState>, polish: bool) {
     }
 
     // Transcribe in background
-    let api_key = state.api_key.clone();
+    let config = state.config.clone();
     let sample_rate = state.sample_rate.load(Ordering::SeqCst);
     thread::spawn(move || {
-        transcribe_and_paste(audio_data, sample_rate, &api_key, polish);
+        transcribe_and_paste(audio_data, sample_rate, &config, polish);
     });
 }
 
-fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str, polish: bool) {
+fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, config: &Config, polish: bool) {
     let wav_data = match encode_wav(&audio, sample_rate) {
         Ok(data) => data,
         Err(_) => return,
@@ -466,7 +602,7 @@ fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str, polish
 
     let client = reqwest::blocking::Client::new();
     let form = reqwest::blocking::multipart::Form::new()
-        .text("model", "whisper-large-v3")  // Full model for better accuracy (vs turbo)
+        .text("model", config.whisper_model.clone())
         .text("response_format", "text")
         .part(
             "file",
@@ -477,22 +613,32 @@ fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str, polish
         );
 
     let response = client
-        .post("https://api.groq.com/openai/v1/audio/transcriptions")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .post(&config.transcription_url)
+        .header("Authorization", format!("Bearer {}", config.api_key))
         .multipart(form)
         .timeout(Duration::from_secs(30))
         .send();
 
     if let Ok(resp) = response {
         if resp.status().is_success() {
-            if let Ok(text) = resp.text() {
-                let text = text.trim();
+            if let Ok(raw) = resp.text() {
+                // Handle both plain text and JSON responses
+                // Some servers (e.g. vLLM) return {"text":"..."} even with response_format=text
+                let text = if raw.trim_start().starts_with('{') {
+                    serde_json::from_str::<serde_json::Value>(raw.trim())
+                        .ok()
+                        .and_then(|v| v.get("text")?.as_str().map(String::from))
+                        .unwrap_or_else(|| raw.trim().to_string())
+                } else {
+                    raw.trim().to_string()
+                };
+
                 if !text.is_empty() {
                     // Apply polish if requested, fallback to raw on error
                     let final_text = if polish {
-                        polish_text(text, api_key).unwrap_or_else(|| text.to_string())
+                        polish_text(&text, config).unwrap_or_else(|| text.clone())
                     } else {
-                        text.to_string()
+                        text
                     };
 
                     if let Ok(mut clipboard) = Clipboard::new() {
@@ -546,11 +692,11 @@ struct ChatMessage {
 
 /// Polish transcribed text using LLM to convert spoken style to written prose.
 /// Returns None on any error (caller should fall back to raw text).
-fn polish_text(text: &str, api_key: &str) -> Option<String> {
+fn polish_text(text: &str, config: &Config) -> Option<String> {
     let client = reqwest::blocking::Client::new();
 
     let body = serde_json::json!({
-        "model": "llama-3.3-70b-versatile",
+        "model": config.polish_model,
         "messages": [
             {
                 "role": "system",
@@ -565,8 +711,8 @@ fn polish_text(text: &str, api_key: &str) -> Option<String> {
     });
 
     let response = client
-        .post("https://api.groq.com/openai/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .post(&config.polish_url)
+        .header("Authorization", format!("Bearer {}", config.api_key))
         .header("Content-Type", "application/json")
         .json(&body)
         .timeout(Duration::from_secs(30))

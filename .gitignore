@@ -1,3 +1,5 @@
 /target/
 FnKey.app/
 .DS_Store
+.venv/
+__pycache__/
