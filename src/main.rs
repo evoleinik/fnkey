@@ -165,6 +165,18 @@ fn default_polish_model() -> String {
 fn default_hotkey() -> String {
     "fn".to_string()
 }
+fn default_language() -> String {
+    String::new() // empty = auto-detect
+}
+fn default_always_polish() -> bool {
+    true
+}
+fn default_polish_prompt() -> String {
+    String::new() // empty = use built-in prompt
+}
+fn default_polish_api_key() -> String {
+    String::new() // empty = use api_key
+}
 
 #[derive(serde::Deserialize, Clone)]
 struct Config {
@@ -180,6 +192,14 @@ struct Config {
     polish_model: String,
     #[serde(default = "default_hotkey")]
     hotkey: String,
+    #[serde(default = "default_language")]
+    language: String,
+    #[serde(default = "default_always_polish")]
+    always_polish: bool,
+    #[serde(default = "default_polish_prompt")]
+    polish_prompt: String,
+    #[serde(default = "default_polish_api_key")]
+    polish_api_key: String,
 }
 
 impl Config {
@@ -201,6 +221,16 @@ impl Config {
             SHIFT_KEY_FLAG
         } else {
             CONTROL_KEY_FLAG
+        }
+    }
+
+    /// API key for the polish/sanitizer endpoint.
+    /// Falls back to the main api_key when polish_api_key is not set.
+    fn polish_key(&self) -> &str {
+        if self.polish_api_key.is_empty() {
+            &self.api_key
+        } else {
+            &self.polish_api_key
         }
     }
 }
@@ -231,6 +261,10 @@ fn load_config() -> Config {
                     whisper_model: default_whisper_model(),
                     polish_model: default_polish_model(),
                     hotkey: default_hotkey(),
+                    language: default_language(),
+                    always_polish: default_always_polish(),
+                    polish_prompt: default_polish_prompt(),
+                    polish_api_key: default_polish_api_key(),
                 };
             }
         }
@@ -244,6 +278,10 @@ fn load_config() -> Config {
                 whisper_model: default_whisper_model(),
                 polish_model: default_polish_model(),
                 hotkey: default_hotkey(),
+                language: default_language(),
+                always_polish: default_always_polish(),
+                polish_prompt: default_polish_prompt(),
+                polish_api_key: default_polish_api_key(),
             };
         }
 
@@ -251,11 +289,15 @@ fn load_config() -> Config {
         let _ = std::fs::create_dir_all(&config_dir);
         let default_toml = r#"# FnKey configuration — edit and relaunch
 # api_key = "your-api-key"
+# polish_api_key = ""  # Separate key for sanitizer (empty = use api_key)
 # transcription_url = "https://your-server/v1/audio/transcriptions"
 # polish_url = "https://your-server/v1/chat/completions"
 # whisper_model = "whisper-large-v3"
 # polish_model = "llama-3.3-70b-versatile"
 # hotkey = "fn"
+# language = ""  # ISO-639-1 code: "en", "sk", "de", "fr", etc. Empty = auto-detect
+# always_polish = true  # Always run LLM cleanup on transcriptions (Ctrl modifier skips it)
+# polish_prompt = ""  # Custom system prompt for polish mode (empty = use built-in)
 "#;
         let _ = std::fs::write(&toml_path, default_toml);
     }
@@ -268,6 +310,10 @@ fn load_config() -> Config {
         whisper_model: default_whisper_model(),
         polish_model: default_polish_model(),
         hotkey: default_hotkey(),
+        language: default_language(),
+        always_polish: default_always_polish(),
+        polish_prompt: default_polish_prompt(),
+        polish_api_key: default_polish_api_key(),
     }
 }
 
@@ -284,6 +330,9 @@ static mut AUDIO_STREAM: Option<Stream> = None;
 
 fn main() {
     let config = load_config();
+
+    // Eagerly build keycode map on main thread — Carbon TIS APIs require main thread
+    let _ = get_paste_keycode();
 
     // Request Input Monitoring permission (non-blocking — app continues either way)
     check_input_monitoring_permission();
@@ -349,11 +398,15 @@ extern "C" fn open_settings(_this: &Object, _cmd: Sel, _sender: id) {
         if !config_path.exists() {
             let default_toml = r#"# FnKey configuration — edit and relaunch
 # api_key = "your-api-key"
+# polish_api_key = ""  # Separate key for sanitizer (empty = use api_key)
 # transcription_url = "https://your-server/v1/audio/transcriptions"
 # polish_url = "https://your-server/v1/chat/completions"
 # whisper_model = "whisper-large-v3"
 # polish_model = "llama-3.3-70b-versatile"
 # hotkey = "fn"
+# language = ""  # ISO-639-1 code: "en", "sk", "de", "fr", etc. Empty = auto-detect
+# always_polish = true  # Always run LLM cleanup on transcriptions (Ctrl modifier skips it)
+# polish_prompt = ""  # Custom system prompt for polish mode (empty = use built-in)
 "#;
             let _ = std::fs::write(&config_path, default_toml);
         }
@@ -601,16 +654,22 @@ fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, config: &Config, poli
     };
 
     let client = reqwest::blocking::Client::new();
-    let form = reqwest::blocking::multipart::Form::new()
+    let mut form = reqwest::blocking::multipart::Form::new()
         .text("model", config.whisper_model.clone())
-        .text("response_format", "text")
-        .part(
-            "file",
-            reqwest::blocking::multipart::Part::bytes(wav_data)
-                .file_name("audio.wav")
-                .mime_str("audio/wav")
-                .unwrap(),
-        );
+        .text("response_format", "text");
+
+    // Send language hint to Whisper if configured (ISO-639-1 code)
+    if !config.language.is_empty() {
+        form = form.text("language", config.language.clone());
+    }
+
+    let form = form.part(
+        "file",
+        reqwest::blocking::multipart::Part::bytes(wav_data)
+            .file_name("audio.wav")
+            .mime_str("audio/wav")
+            .unwrap(),
+    );
 
     let response = client
         .post(&config.transcription_url)
@@ -634,8 +693,10 @@ fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, config: &Config, poli
                 };
 
                 if !text.is_empty() {
-                    // Apply polish if requested, fallback to raw on error
-                    let final_text = if polish {
+                    // When always_polish is on: polish by default, Ctrl modifier = raw
+                    // When always_polish is off: raw by default, Ctrl modifier = polish
+                    let should_polish = if config.always_polish { !polish } else { polish };
+                    let final_text = if should_polish {
                         polish_text(&text, config).unwrap_or_else(|| text.clone())
                     } else {
                         text
@@ -695,12 +756,28 @@ struct ChatMessage {
 fn polish_text(text: &str, config: &Config) -> Option<String> {
     let client = reqwest::blocking::Client::new();
 
+    let system_prompt = if !config.polish_prompt.is_empty() {
+        config.polish_prompt.clone()
+    } else if config.language.is_empty() || config.language == "en" {
+        "Fix dictation. Remove filler words (um, uh, like, you know, basically). \
+         Remove repeated words. Fix grammar and punctuation. \
+         Keep the same tone and meaning. Output ONLY the corrected text. /no_think".to_string()
+    } else {
+        format!(
+            "Fix dictation in language \"{}\". Remove filler words and hesitations. \
+             Remove repeated words. Fix grammar and punctuation. \
+             Keep the same language, tone and meaning. Do NOT translate. \
+             Output ONLY the corrected text. /no_think",
+            config.language
+        )
+    };
+
     let body = serde_json::json!({
         "model": config.polish_model,
         "messages": [
             {
                 "role": "system",
-                "content": "Clean up this voice message for texting. Remove filler words (um, uh, like, you know). Fix punctuation and sentence structure. Break up run-on sentences. Keep it casual. No trailing period. Output ONLY the cleaned text - no explanations, no quotes."
+                "content": system_prompt
             },
             {
                 "role": "user",
@@ -712,7 +789,7 @@ fn polish_text(text: &str, config: &Config) -> Option<String> {
 
     let response = client
         .post(&config.polish_url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
+        .header("Authorization", format!("Bearer {}", config.polish_key()))
         .header("Content-Type", "application/json")
         .json(&body)
         .timeout(Duration::from_secs(30))
