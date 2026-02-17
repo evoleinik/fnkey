@@ -648,10 +648,15 @@ fn stop_recording(state: &Arc<AppState>, polish: bool) {
 }
 
 fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, config: &Config, polish: bool) {
+    let duration_secs = audio.len() as f32 / sample_rate as f32;
+    eprintln!("[fnkey] audio: {:.1}s, {} samples, {}Hz, {:.0}KB raw",
+        duration_secs, audio.len(), sample_rate, audio.len() as f32 * 4.0 / 1024.0);
+
     let wav_data = match encode_wav(&audio, sample_rate) {
         Ok(data) => data,
         Err(_) => return,
     };
+    eprintln!("[fnkey] wav: {:.0}KB", wav_data.len() as f32 / 1024.0);
 
     let client = reqwest::blocking::Client::new();
     let mut form = reqwest::blocking::multipart::Form::new()
@@ -681,6 +686,7 @@ fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, config: &Config, poli
     if let Ok(resp) = response {
         if resp.status().is_success() {
             if let Ok(raw) = resp.text() {
+                eprintln!("[fnkey] whisper raw response ({} bytes): {:.200}", raw.len(), raw);
                 // Handle both plain text and JSON responses
                 // Some servers (e.g. vLLM) return {"text":"..."} even with response_format=text
                 let text = if raw.trim_start().starts_with('{') {
@@ -693,12 +699,16 @@ fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, config: &Config, poli
                 };
 
                 if !text.is_empty() {
+                    eprintln!("[fnkey] whisper text: {}", text);
                     // When always_polish is on: polish by default, Ctrl modifier = raw
                     // When always_polish is off: raw by default, Ctrl modifier = polish
                     let should_polish = if config.always_polish { !polish } else { polish };
                     let final_text = if should_polish {
-                        polish_text(&text, config).unwrap_or_else(|| text.clone())
+                        let polished = polish_text(&text, config).unwrap_or_else(|| text.clone());
+                        eprintln!("[fnkey] polished: {}", polished);
+                        polished
                     } else {
+                        eprintln!("[fnkey] raw (no polish)");
                         text
                     };
 
@@ -772,6 +782,11 @@ fn polish_text(text: &str, config: &Config) -> Option<String> {
         )
     };
 
+    // Cap output tokens: rough estimate of input tokens (words * 1.3) doubled as headroom,
+    // with a floor of 64 and ceiling of 1024. Prevents hallucination runaway on small models.
+    let estimated_tokens = (text.split_whitespace().count() as f32 * 1.3 * 2.0) as u64;
+    let max_tokens = estimated_tokens.clamp(64, 1024);
+
     let body = serde_json::json!({
         "model": config.polish_model,
         "messages": [
@@ -784,7 +799,8 @@ fn polish_text(text: &str, config: &Config) -> Option<String> {
                 "content": text
             }
         ],
-        "temperature": 0.2
+        "temperature": 0.2,
+        "max_tokens": max_tokens
     });
 
     let response = client
