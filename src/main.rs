@@ -1,14 +1,18 @@
 //! fnkey.ai - Hold Fn key, speak, paste transcribed text
 //!
-//! Usage:
-//!   export GROQ_API_KEY="your-key"
-//!   open FnKey.app
+//! Streams audio to Deepgram via WebSocket for real-time transcription.
+//! Falls back to Groq Whisper batch API if Deepgram key not configured.
+//!
+//! Config files (~/.config/fnkey/):
+//!   deepgram_key  - Deepgram API key (streaming, preferred)
+//!   api_key       - Groq API key (batch fallback + polish)
 
 use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -28,21 +32,19 @@ use cpal::Stream;
 use hound::{WavSpec, WavWriter};
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
+use tungstenite::protocol::Message;
 
 // ============================================================================
 // Keyboard layout detection (for non-Latin layouts like Russian)
 // ============================================================================
 
-/// Cached keycode map - built once on first access
 static KEYCODE_MAP: OnceLock<HashMap<char, u16>> = OnceLock::new();
 
-/// Opaque type for keyboard layout data structure
 #[repr(C)]
 struct UCKeyboardLayout {
     _opaque: [u8; 0],
 }
 
-// FFI declarations for Carbon/CoreServices APIs
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
     fn TISCopyCurrentASCIICapableKeyboardLayoutInputSource() -> *const c_void;
@@ -70,62 +72,41 @@ extern "C" {
 const KUC_KEY_ACTION_DISPLAY: u16 = 3;
 const QWERTY_V_KEYCODE: u16 = 9;
 
-/// Build a lookup table mapping lowercase characters to their keycodes
 fn build_char_to_keycode_map() -> HashMap<char, u16> {
     let mut map = HashMap::new();
-
     unsafe {
         let input_source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource();
         if input_source.is_null() {
             return map;
         }
-
         let layout_data_ref = TISGetInputSourceProperty(input_source, kTISPropertyUnicodeKeyLayoutData);
         if layout_data_ref.is_null() {
             core_foundation::base::CFRelease(input_source);
             return map;
         }
-
-        // Get the layout data bytes
         let layout_data: core_foundation::data::CFData =
             core_foundation::base::TCFType::wrap_under_get_rule(layout_data_ref as *const _);
         let layout_ptr = layout_data.bytes().as_ptr() as *const UCKeyboardLayout;
         let kbd_type = LMGetKbdType();
-
-        // Iterate through keycodes 0-127 to build reverse lookup
         for keycode in 0u16..128 {
             let mut dead_key_state: u32 = 0;
             let mut char_buf: [u16; 4] = [0; 4];
             let mut actual_len: usize = 0;
-
             let result = UCKeyTranslate(
-                layout_ptr,
-                keycode,
-                KUC_KEY_ACTION_DISPLAY,
-                0,
-                kbd_type,
-                0,
-                &mut dead_key_state,
-                char_buf.len(),
-                &mut actual_len,
-                char_buf.as_mut_ptr(),
+                layout_ptr, keycode, KUC_KEY_ACTION_DISPLAY, 0, kbd_type, 0,
+                &mut dead_key_state, char_buf.len(), &mut actual_len, char_buf.as_mut_ptr(),
             );
-
             if result == 0 && actual_len == 1 {
                 if let Some(ch) = char::from_u32(u32::from(char_buf[0])) {
                     map.entry(ch.to_ascii_lowercase()).or_insert(keycode);
                 }
             }
         }
-
         core_foundation::base::CFRelease(input_source);
     }
-
     map
 }
 
-/// Get the keycode for 'v' in the current keyboard layout.
-/// Falls back to QWERTY keycode (9) if lookup fails.
 fn get_paste_keycode() -> u16 {
     let map = KEYCODE_MAP.get_or_init(build_char_to_keycode_map);
     map.get(&'v').copied().unwrap_or(QWERTY_V_KEYCODE)
@@ -135,101 +116,520 @@ fn get_paste_keycode() -> u16 {
 // Main application
 // ============================================================================
 
-// Fn key flag in CGEventFlags
 const FN_KEY_FLAG: u64 = 0x800000;
-// Option/Alt key flag
 const OPTION_KEY_FLAG: u64 = 0x80000;
-// Control key flag
 const CONTROL_KEY_FLAG: u64 = 0x40000;
+const DEEPGRAM_SAMPLE_RATE: u32 = 16000;
+
+/// Messages sent from audio callback / event tap to the WebSocket thread
+enum WsCommand {
+    /// Raw PCM audio chunk (already resampled to 16kHz, i16 LE bytes)
+    Audio(Vec<u8>),
+    /// Stop streaming, finalize, paste result
+    Stop { polish: bool },
+}
 
 struct AppState {
     audio_buffer: Arc<Mutex<Vec<f32>>>,
-    api_key: String,
+    groq_key: Option<String>,
+    deepgram_key: Option<String>,
     use_fn_key: AtomicBool,
     sample_rate: std::sync::atomic::AtomicU32,
+    /// Channel to send commands to the active WebSocket thread
+    ws_tx: Mutex<Option<mpsc::Sender<WsCommand>>>,
+    /// Whether a Deepgram stream is active
+    ws_active: Arc<AtomicBool>,
 }
 
-// Global status item pointer for updating from callbacks
 static mut STATUS_ITEM: *mut Object = std::ptr::null_mut();
-// Global audio stream (not Send, so can't be in Arc)
 static mut AUDIO_STREAM: Option<Stream> = None;
 
-/// Get API key from config file or environment variable.
-/// Checks ~/.config/fnkey/api_key first, then GROQ_API_KEY env var.
-fn get_api_key() -> Option<String> {
-    // Try config file first
-    if let Some(home) = env::var_os("HOME") {
-        let config_path = std::path::Path::new(&home)
-            .join(".config")
-            .join("fnkey")
-            .join("api_key");
-        if let Ok(key) = std::fs::read_to_string(&config_path) {
-            let key = key.trim();
-            if !key.is_empty() {
-                return Some(key.to_string());
-            }
-        }
-    }
-    // Fall back to environment variable
-    env::var("GROQ_API_KEY").ok()
+fn read_config_file(name: &str) -> Option<String> {
+    let home = env::var_os("HOME")?;
+    let path = std::path::Path::new(&home).join(".config").join("fnkey").join(name);
+    let key = std::fs::read_to_string(&path).ok()?;
+    let key = key.trim();
+    if key.is_empty() { None } else { Some(key.to_string()) }
 }
 
 fn main() {
-    let api_key = get_api_key().unwrap_or_else(|| {
+    let deepgram_key = read_config_file("deepgram_key")
+        .or_else(|| env::var("DEEPGRAM_API_KEY").ok());
+    let groq_key = read_config_file("api_key")
+        .or_else(|| env::var("GROQ_API_KEY").ok());
+
+    if deepgram_key.is_none() && groq_key.is_none() {
         show_alert(
-            "GROQ_API_KEY not configured",
-            "Please create ~/.config/fnkey/api_key with your Groq API key.\n\nExample:\n  mkdir -p ~/.config/fnkey\n  echo 'gsk_your_key_here' > ~/.config/fnkey/api_key"
+            "No API key configured",
+            "Please create ~/.config/fnkey/deepgram_key with your Deepgram API key.\n\n\
+             Example:\n  mkdir -p ~/.config/fnkey\n  echo 'your_key' > ~/.config/fnkey/deepgram_key\n\n\
+             Get a key at https://console.deepgram.com (includes $200 free credit)"
         );
         std::process::exit(1);
-    });
+    }
 
-    // Check Input Monitoring permission
     if !check_input_monitoring_permission() {
         std::process::exit(1);
     }
 
     let state = Arc::new(AppState {
         audio_buffer: Arc::new(Mutex::new(Vec::new())),
-        api_key,
+        groq_key,
+        deepgram_key,
         use_fn_key: AtomicBool::new(true),
-        sample_rate: std::sync::atomic::AtomicU32::new(48000), // Default, will be updated
+        sample_rate: std::sync::atomic::AtomicU32::new(48000),
+        ws_tx: Mutex::new(None),
+        ws_active: Arc::new(AtomicBool::new(false)),
     });
 
-    // Initialize NSApplication
     unsafe {
         let _pool = NSAutoreleasePool::new(nil);
         let app = NSApp();
         app.setActivationPolicy_(NSApplicationActivationPolicyAccessory);
-
-        // Create menu bar status item
         create_status_item();
     }
 
-    // Start event tap for key detection
     run_event_tap(state);
 }
 
+// ============================================================================
+// Deepgram streaming — runs entirely on a background thread
+// ============================================================================
+
+/// Spawn a background thread that:
+/// 1. Connects WebSocket to Deepgram
+/// 2. Reads audio from rx channel, sends to WS
+/// 3. Reads transcripts from WS
+/// 4. On Stop command: closes stream, pastes result
+fn spawn_deepgram_thread(
+    key: String,
+    rx: mpsc::Receiver<WsCommand>,
+    groq_key: Option<String>,
+) {
+    thread::spawn(move || {
+        let url = format!(
+            "wss://api.deepgram.com/v1/listen?\
+             encoding=linear16&sample_rate={}&channels=1&\
+             interim_results=true&endpointing=300&\
+             punctuate=true&smart_format=true&model=nova-3",
+            DEEPGRAM_SAMPLE_RATE
+        );
+
+        let request = tungstenite::http::Request::builder()
+            .uri(&url)
+            .header("Authorization", format!("Token {}", key))
+            .header("Host", "api.deepgram.com")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
+            .body(())
+            .unwrap();
+
+        let (mut ws, _response) = match tungstenite::connect(request) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("[fnkey] Deepgram connect failed: {}", e);
+                // Drain remaining commands so senders don't block
+                for _ in rx.iter() {}
+                return;
+            }
+        };
+
+        // Set WebSocket to non-blocking so we can interleave send/recv
+        if let tungstenite::stream::MaybeTlsStream::NativeTls(ref s) = ws.get_ref() {
+            let _ = s.get_ref().set_nonblocking(true);
+        } else if let tungstenite::stream::MaybeTlsStream::Plain(ref s) = ws.get_ref() {
+            let _ = s.set_nonblocking(true);
+        }
+
+        let mut transcript = String::new();
+        let mut running = true;
+
+        while running {
+            // 1. Check for commands from audio callback / event tap
+            match rx.try_recv() {
+                Ok(WsCommand::Audio(bytes)) => {
+                    let _ = ws.send(Message::Binary(bytes));
+                }
+                Ok(WsCommand::Stop { polish }) => {
+                    // Send CloseStream, then drain remaining transcripts
+                    let close_msg = serde_json::json!({"type": "CloseStream"});
+                    let _ = ws.send(Message::Text(close_msg.to_string()));
+
+                    // Switch to blocking for final drain
+                    if let tungstenite::stream::MaybeTlsStream::NativeTls(ref s) = ws.get_ref() {
+                        let _ = s.get_ref().set_nonblocking(false);
+                        let _ = s.get_ref().set_read_timeout(Some(Duration::from_secs(3)));
+                    } else if let tungstenite::stream::MaybeTlsStream::Plain(ref s) = ws.get_ref() {
+                        let _ = s.set_nonblocking(false);
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+                    }
+
+                    // Read remaining final transcripts
+                    loop {
+                        match ws.read() {
+                            Ok(Message::Text(text)) => {
+                                accumulate_transcript(&text, &mut transcript);
+                            }
+                            Ok(Message::Close(_)) | Err(_) => break,
+                            _ => {}
+                        }
+                    }
+                    let _ = ws.close(None);
+
+                    let text = transcript.trim().to_string();
+                    if !text.is_empty() {
+                        let final_text = if polish {
+                            if let Some(ref gk) = groq_key {
+                                polish_text(&text, gk).unwrap_or(text)
+                            } else {
+                                text
+                            }
+                        } else {
+                            text
+                        };
+                        if let Ok(mut clipboard) = Clipboard::new() {
+                            if clipboard.set_text(&final_text).is_ok() {
+                                paste_with_cgevent();
+                            }
+                        }
+                    }
+                    running = false;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    running = false;
+                }
+            }
+
+            // 2. Try to read transcript from WebSocket (non-blocking)
+            match ws.read() {
+                Ok(Message::Text(text)) => {
+                    accumulate_transcript(&text, &mut transcript);
+                }
+                Ok(Message::Close(_)) => {
+                    running = false;
+                }
+                Err(tungstenite::Error::Io(ref e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    running = false;
+                }
+                _ => {}
+            }
+
+            // Small sleep to avoid busy-spinning
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+}
+
+fn accumulate_transcript(json_text: &str, transcript: &mut String) {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_text) {
+        let is_final = v.get("is_final").and_then(|f| f.as_bool()).unwrap_or(false);
+        let text = v.get("channel")
+            .and_then(|c| c.get("alternatives"))
+            .and_then(|a| a.get(0))
+            .and_then(|a| a.get("transcript"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if is_final && !text.is_empty() {
+            if !transcript.is_empty() {
+                transcript.push(' ');
+            }
+            transcript.push_str(text);
+        }
+    }
+}
+
+/// Simple linear resampling
+fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ratio = from_rate as f64 / to_rate as f64;
+    let out_len = (samples.len() as f64 / ratio) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_idx = i as f64 * ratio;
+        let idx = src_idx as usize;
+        let frac = src_idx - idx as f64;
+        let s = if idx + 1 < samples.len() {
+            samples[idx] as f64 * (1.0 - frac) + samples[idx + 1] as f64 * frac
+        } else {
+            samples[idx.min(samples.len() - 1)] as f64
+        };
+        out.push(s as f32);
+    }
+    out
+}
+
+// ============================================================================
+// Groq batch fallback
+// ============================================================================
+
+fn transcribe_groq(audio: Vec<f32>, sample_rate: u32, api_key: &str) -> Option<String> {
+    let wav_data = encode_wav(&audio, sample_rate).ok()?;
+    let client = reqwest::blocking::Client::new();
+    let form = reqwest::blocking::multipart::Form::new()
+        .text("model", "whisper-large-v3")
+        .text("response_format", "text")
+        .part(
+            "file",
+            reqwest::blocking::multipart::Part::bytes(wav_data)
+                .file_name("audio.wav")
+                .mime_str("audio/wav")
+                .unwrap(),
+        );
+    let response = client
+        .post("https://api.groq.com/openai/v1/audio/transcriptions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .multipart(form)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .ok()?;
+    if !response.status().is_success() { return None; }
+    let text = response.text().ok()?;
+    let text = text.trim();
+    if text.is_empty() { None } else { Some(text.to_string()) }
+}
+
+// ============================================================================
+// Recording lifecycle — all non-blocking from event tap's perspective
+// ============================================================================
+
+fn init_audio_stream(state: &Arc<AppState>) {
+    let host = cpal::default_host();
+    let device = match host.default_input_device() {
+        Some(d) => d,
+        None => return,
+    };
+    let supported_config = match device.default_input_config() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let actual_sample_rate = supported_config.sample_rate().0;
+    state.sample_rate.store(actual_sample_rate, Ordering::SeqCst);
+
+    let config = cpal::StreamConfig {
+        channels: 1,
+        sample_rate: supported_config.sample_rate(),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let buffer = Arc::clone(&state.audio_buffer);
+    let ws_active = Arc::clone(&state.ws_active);
+    let ws_tx: Arc<Mutex<Option<mpsc::Sender<WsCommand>>>> = Arc::new(Mutex::new(None));
+
+    // Store a reference so start_recording can update the sender
+    // We'll use a different approach: read ws_tx from state each time
+    let state_ws_tx = state.ws_tx.lock().unwrap().clone();
+    // Actually, we need the audio callback to access the current ws_tx.
+    // Since ws_tx changes each recording session, we need a shared reference.
+    // Let's use an Arc<Mutex<Option<Sender>>> that the callback reads from.
+    let tx_for_callback: Arc<Mutex<Option<mpsc::Sender<WsCommand>>>> = Arc::new(Mutex::new(None));
+    // Store this so start_recording can update it
+    // Hmm, this gets tricky. Let me use a simpler approach:
+    // The audio callback always buffers. A separate "forwarder" thread reads
+    // the buffer periodically and sends to WS. But that adds latency.
+    //
+    // Better: store the sender in state, audio callback reads from state.
+    drop(state_ws_tx);
+
+    let state_ref = Arc::clone(&state.ws_active); // just for the closure
+    let sr = actual_sample_rate;
+
+    // We need access to state.ws_tx from the audio callback.
+    // But state isn't available here... let's pass it differently.
+    // Actually, let's just buffer audio and have a forwarder thread.
+    // The forwarder drains the buffer every 20ms and sends to WS.
+    // This adds max 20ms latency which is fine for speech.
+
+    let stream = device
+        .build_input_stream(
+            &config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let mut buf = buffer.lock().unwrap();
+                buf.extend_from_slice(data);
+            },
+            |err| eprintln!("Audio error: {}", err),
+            None,
+        )
+        .ok();
+
+    unsafe {
+        AUDIO_STREAM = stream;
+    }
+}
+
+/// Called from event tap — must be non-blocking
+fn start_recording(state: &Arc<AppState>) {
+    // Clear buffer
+    {
+        let mut buffer = state.audio_buffer.lock().unwrap();
+        buffer.clear();
+    }
+
+    // Init audio stream on first use
+    unsafe {
+        if AUDIO_STREAM.is_none() {
+            init_audio_stream(state);
+        }
+        if let Some(ref s) = AUDIO_STREAM {
+            let _ = s.play();
+        }
+    }
+
+    update_status_icon(true);
+
+    // Spawn Deepgram streaming in background (non-blocking)
+    if let Some(ref dg_key) = state.deepgram_key {
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut ws_tx = state.ws_tx.lock().unwrap();
+            *ws_tx = Some(tx);
+        }
+        state.ws_active.store(true, Ordering::SeqCst);
+
+        let key = dg_key.clone();
+        let groq_key = state.groq_key.clone();
+        spawn_deepgram_thread(key, rx, groq_key);
+
+        // Spawn audio forwarder: drains buffer, resamples, sends to WS thread
+        let buffer = Arc::clone(&state.audio_buffer);
+        let ws_active = Arc::clone(&state.ws_active);
+        let ws_tx_ref = state.ws_tx.lock().unwrap().clone();
+        if let Some(tx) = ws_tx_ref {
+            let sr = state.sample_rate.load(Ordering::SeqCst);
+            thread::spawn(move || {
+                while ws_active.load(Ordering::SeqCst) {
+                    let chunk: Vec<f32> = {
+                        let mut buf = buffer.lock().unwrap();
+                        if buf.is_empty() {
+                            drop(buf);
+                            thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        buf.drain(..).collect()
+                    };
+
+                    let resampled = if sr != DEEPGRAM_SAMPLE_RATE {
+                        resample(&chunk, sr, DEEPGRAM_SAMPLE_RATE)
+                    } else {
+                        chunk
+                    };
+
+                    let mut bytes = Vec::with_capacity(resampled.len() * 2);
+                    for &sample in &resampled {
+                        let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                        bytes.extend_from_slice(&s.to_le_bytes());
+                    }
+
+                    if tx.send(WsCommand::Audio(bytes)).is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            });
+        }
+    }
+}
+
+/// Called from event tap — must be non-blocking
+fn stop_recording(state: &Arc<AppState>, polish: bool) {
+    // Pause audio
+    unsafe {
+        if let Some(ref s) = AUDIO_STREAM {
+            let _ = s.pause();
+        }
+    }
+
+    update_status_icon(false);
+
+    let was_streaming = state.ws_active.load(Ordering::SeqCst);
+
+    if was_streaming {
+        // Signal the WS thread to stop (it handles paste internally)
+        state.ws_active.store(false, Ordering::SeqCst);
+
+        // Small delay to let forwarder send remaining audio
+        let ws_tx = state.ws_tx.lock().unwrap().take();
+        if let Some(tx) = ws_tx {
+            // Drain any remaining audio in the buffer
+            let remaining: Vec<f32> = {
+                let mut buf = state.audio_buffer.lock().unwrap();
+                buf.drain(..).collect()
+            };
+            if !remaining.is_empty() {
+                let sr = state.sample_rate.load(Ordering::SeqCst);
+                let resampled = if sr != DEEPGRAM_SAMPLE_RATE {
+                    resample(&remaining, sr, DEEPGRAM_SAMPLE_RATE)
+                } else {
+                    remaining
+                };
+                let mut bytes = Vec::with_capacity(resampled.len() * 2);
+                for &sample in &resampled {
+                    let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                let _ = tx.send(WsCommand::Audio(bytes));
+            }
+            // Tell WS thread to finalize
+            let _ = tx.send(WsCommand::Stop { polish });
+            // tx drops here, which will also signal the thread
+        }
+    } else {
+        // Groq batch fallback (in background thread)
+        let audio_data: Vec<f32> = {
+            let buffer = state.audio_buffer.lock().unwrap();
+            buffer.clone()
+        };
+        if audio_data.is_empty() {
+            return;
+        }
+        let sample_rate = state.sample_rate.load(Ordering::SeqCst);
+        let groq_key = state.groq_key.clone();
+        thread::spawn(move || {
+            if let Some(ref key) = groq_key {
+                if let Some(text) = transcribe_groq(audio_data, sample_rate, key) {
+                    let final_text = if polish {
+                        polish_text(&text, key).unwrap_or(text)
+                    } else {
+                        text
+                    };
+                    if let Ok(mut clipboard) = Clipboard::new() {
+                        if clipboard.set_text(&final_text).is_ok() {
+                            paste_with_cgevent();
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+// ============================================================================
+// UI, permissions, event tap
+// ============================================================================
+
 fn check_input_monitoring_permission() -> bool {
     unsafe {
-        // CGPreflightListenEventAccess and CGRequestListenEventAccess
         #[link(name = "CoreGraphics", kind = "framework")]
         extern "C" {
             fn CGPreflightListenEventAccess() -> bool;
             fn CGRequestListenEventAccess() -> bool;
         }
-
         if CGPreflightListenEventAccess() {
             return true;
         }
-
-        // Request permission - this shows system dialog
         if CGRequestListenEventAccess() {
             return true;
         }
-
         show_alert(
             "Input Monitoring Required",
-            "FnKey needs Input Monitoring permission to detect the Fn key.\n\nPlease grant access in System Settings → Privacy & Security → Input Monitoring, then relaunch FnKey.",
+            "FnKey needs Input Monitoring permission to detect the Fn key.\n\n\
+             Please grant access in System Settings → Privacy & Security → Input Monitoring, then relaunch FnKey.",
         );
         false
     }
@@ -238,11 +638,9 @@ fn check_input_monitoring_permission() -> bool {
 fn show_alert(title: &str, message: &str) {
     unsafe {
         let _pool = NSAutoreleasePool::new(nil);
-
         let alert: id = msg_send![class!(NSAlert), new];
         let title_str = NSString::alloc(nil).init_str(title);
         let msg_str = NSString::alloc(nil).init_str(message);
-
         let _: () = msg_send![alert, setMessageText: title_str];
         let _: () = msg_send![alert, setInformativeText: msg_str];
         let _: () = msg_send![alert, runModal];
@@ -251,26 +649,19 @@ fn show_alert(title: &str, message: &str) {
 
 unsafe fn create_status_item() {
     let status_bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
-    let status_item: id = msg_send![status_bar, statusItemWithLength: -1.0_f64]; // NSVariableStatusItemLength
+    let status_item: id = msg_send![status_bar, statusItemWithLength: -1.0_f64];
     let _: () = msg_send![status_item, retain];
     STATUS_ITEM = status_item as *mut Object;
-
-    // Set initial title
     let title = NSString::alloc(nil).init_str("○");
     let button: id = msg_send![status_item, button];
     let _: () = msg_send![button, setTitle: title];
-
-    // Create menu
     let menu: id = NSMenu::new(nil);
-
-    // Quit item
     let quit_title = NSString::alloc(nil).init_str("Quit FnKey");
     let quit_key = NSString::alloc(nil).init_str("q");
     let quit_item: id = msg_send![class!(NSMenuItem), alloc];
     let quit_item: id = msg_send![quit_item, initWithTitle: quit_title action: sel!(terminate:) keyEquivalent: quit_key];
     let _: () = msg_send![quit_item, setTarget: NSApp()];
     let _: () = msg_send![menu, addItem: quit_item];
-
     let _: () = msg_send![status_item, setMenu: menu];
 }
 
@@ -294,7 +685,7 @@ fn run_event_tap(state: Arc<AppState>) {
 
     let fn_detected_clone = Arc::clone(&fn_detected);
     let was_pressed_clone = Arc::clone(&was_pressed);
-    let ctrl_latched_clone = Arc::clone(&ctrl_was_held); // Latches true if Ctrl pressed anytime during recording
+    let ctrl_latched_clone = Arc::clone(&ctrl_was_held);
 
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -303,34 +694,26 @@ fn run_event_tap(state: Arc<AppState>) {
         vec![CGEventType::FlagsChanged],
         move |_, _, event| {
             let flags = event.get_flags().bits();
-
-            // Check Fn key first, then Option as fallback
             let fn_pressed = (flags & FN_KEY_FLAG) != 0;
             let option_pressed = (flags & OPTION_KEY_FLAG) != 0;
             let ctrl_pressed = (flags & CONTROL_KEY_FLAG) != 0;
-
             let use_fn = state_for_callback.use_fn_key.load(Ordering::SeqCst);
             let key_pressed = if use_fn { fn_pressed } else { option_pressed };
 
-            // Detect if Fn key works (first time detection)
             if fn_pressed && !fn_detected_clone.load(Ordering::SeqCst) {
                 fn_detected_clone.store(true, Ordering::SeqCst);
             }
 
             let prev_pressed = was_pressed_clone.load(Ordering::SeqCst);
 
-            // Handle key state changes
             if key_pressed && !prev_pressed {
-                // Key pressed - start recording, reset Ctrl latch
                 ctrl_latched_clone.store(false, Ordering::SeqCst);
                 start_recording(&state_for_callback);
             } else if !key_pressed && prev_pressed {
-                // Key released - stop recording and transcribe
                 let polish = ctrl_latched_clone.load(Ordering::SeqCst);
                 stop_recording(&state_for_callback, polish);
             }
 
-            // Latch Ctrl if pressed anytime during recording
             if key_pressed && ctrl_pressed {
                 ctrl_latched_clone.store(true, Ordering::SeqCst);
             }
@@ -341,17 +724,12 @@ fn run_event_tap(state: Arc<AppState>) {
     )
     .expect("Failed to create event tap - check Input Monitoring permissions");
 
-    let source = tap
-        .mach_port
-        .create_runloop_source(0)
+    let source = tap.mach_port.create_runloop_source(0)
         .expect("Failed to create runloop source");
-
     let run_loop = CFRunLoop::get_current();
     run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
-
     tap.enable();
 
-    // Fallback timer: if no Fn detected in 5 seconds, switch to Option
     let state_fallback = Arc::clone(&state);
     let fn_detected_fallback = Arc::clone(&fn_detected);
     thread::spawn(move || {
@@ -366,158 +744,13 @@ fn run_event_tap(state: Arc<AppState>) {
     }
 }
 
-fn init_audio_stream(state: &Arc<AppState>) {
-    let host = cpal::default_host();
-    let device = match host.default_input_device() {
-        Some(d) => d,
-        None => return,
-    };
-
-    // Use device's default config instead of hardcoded 16kHz
-    let supported_config = match device.default_input_config() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let actual_sample_rate = supported_config.sample_rate().0;
-    state.sample_rate.store(actual_sample_rate, Ordering::SeqCst);
-
-    let config = cpal::StreamConfig {
-        channels: 1,  // Force mono
-        sample_rate: supported_config.sample_rate(),
-        buffer_size: cpal::BufferSize::Default,
-    };
-
-    let buffer = Arc::clone(&state.audio_buffer);
-    let stream = device
-        .build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let mut buf = buffer.lock().unwrap();
-                buf.extend_from_slice(data);
-            },
-            |err| eprintln!("Audio error: {}", err),
-            None,
-        )
-        .ok();
-
-    // Store stream but don't start it yet (keeps mic indicator off)
-    unsafe {
-        AUDIO_STREAM = stream;
-    }
-}
-
-fn start_recording(state: &Arc<AppState>) {
-    // Clear buffer
-    {
-        let mut buffer = state.audio_buffer.lock().unwrap();
-        buffer.clear();
-    }
-
-    // Create stream on first use, reuse on subsequent uses
-    unsafe {
-        if AUDIO_STREAM.is_none() {
-            init_audio_stream(state);
-        }
-        if let Some(ref s) = AUDIO_STREAM {
-            let _ = s.play();
-        }
-    }
-
-    update_status_icon(true);
-}
-
-fn stop_recording(state: &Arc<AppState>, polish: bool) {
-    // Pause the stream first (keeps data)
-    unsafe {
-        if let Some(ref s) = AUDIO_STREAM {
-            let _ = s.pause();
-        }
-    }
-
-    // Small delay to let final audio data arrive
-    thread::sleep(Duration::from_millis(50));
-
-    // Get audio buffer
-    let audio_data: Vec<f32> = {
-        let buffer = state.audio_buffer.lock().unwrap();
-        buffer.clone()
-    };
-
-    update_status_icon(false);
-
-    if audio_data.is_empty() {
-        return;
-    }
-
-    // Transcribe in background
-    let api_key = state.api_key.clone();
-    let sample_rate = state.sample_rate.load(Ordering::SeqCst);
-    thread::spawn(move || {
-        transcribe_and_paste(audio_data, sample_rate, &api_key, polish);
-    });
-}
-
-fn transcribe_and_paste(audio: Vec<f32>, sample_rate: u32, api_key: &str, polish: bool) {
-    let wav_data = match encode_wav(&audio, sample_rate) {
-        Ok(data) => data,
-        Err(_) => return,
-    };
-
-    let client = reqwest::blocking::Client::new();
-    let form = reqwest::blocking::multipart::Form::new()
-        .text("model", "whisper-large-v3")  // Full model for better accuracy (vs turbo)
-        .text("response_format", "text")
-        .part(
-            "file",
-            reqwest::blocking::multipart::Part::bytes(wav_data)
-                .file_name("audio.wav")
-                .mime_str("audio/wav")
-                .unwrap(),
-        );
-
-    let response = client
-        .post("https://api.groq.com/openai/v1/audio/transcriptions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .multipart(form)
-        .timeout(Duration::from_secs(30))
-        .send();
-
-    if let Ok(resp) = response {
-        if resp.status().is_success() {
-            if let Ok(text) = resp.text() {
-                let text = text.trim();
-                if !text.is_empty() {
-                    // Apply polish if requested, fallback to raw on error
-                    let final_text = if polish {
-                        polish_text(text, api_key).unwrap_or_else(|| text.to_string())
-                    } else {
-                        text.to_string()
-                    };
-
-                    if let Ok(mut clipboard) = Clipboard::new() {
-                        if clipboard.set_text(&final_text).is_ok() {
-                            paste_with_cgevent();
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn paste_with_cgevent() {
     if let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
-        // Get layout-aware keycode for 'v' (works with Dvorak, Colemak, Russian, etc.)
         let v_keycode = get_paste_keycode();
-
         if let Ok(key_down) = CGEvent::new_keyboard_event(source.clone(), v_keycode, true) {
             if let Ok(key_up) = CGEvent::new_keyboard_event(source, v_keycode, false) {
-                // Add Command modifier
                 key_down.set_flags(CGEventFlags::CGEventFlagCommand);
                 key_up.set_flags(CGEventFlags::CGEventFlagCommand);
-
-                // Post events
                 key_down.post(CGEventTapLocation::HID);
                 key_up.post(CGEventTapLocation::HID);
             }
@@ -526,7 +759,7 @@ fn paste_with_cgevent() {
 }
 
 // ============================================================================
-// LLM Polish (spoken -> written style)
+// LLM Polish (kept on Groq - fast and cheap)
 // ============================================================================
 
 #[derive(serde::Deserialize)]
@@ -544,11 +777,8 @@ struct ChatMessage {
     content: String,
 }
 
-/// Polish transcribed text using LLM to convert spoken style to written prose.
-/// Returns None on any error (caller should fall back to raw text).
 fn polish_text(text: &str, api_key: &str) -> Option<String> {
     let client = reqwest::blocking::Client::new();
-
     let body = serde_json::json!({
         "model": "llama-3.3-70b-versatile",
         "messages": [
@@ -556,14 +786,10 @@ fn polish_text(text: &str, api_key: &str) -> Option<String> {
                 "role": "system",
                 "content": "Clean up this voice message for texting. Remove filler words (um, uh, like, you know). Fix punctuation and sentence structure. Break up run-on sentences. Keep it casual. No trailing period. Output ONLY the cleaned text - no explanations, no quotes."
             },
-            {
-                "role": "user",
-                "content": text
-            }
+            { "role": "user", "content": text }
         ],
         "temperature": 0.2
     });
-
     let response = client
         .post("https://api.groq.com/openai/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
@@ -572,51 +798,36 @@ fn polish_text(text: &str, api_key: &str) -> Option<String> {
         .timeout(Duration::from_secs(30))
         .send()
         .ok()?;
-
-    if !response.status().is_success() {
-        return None;
-    }
-
+    if !response.status().is_success() { return None; }
     let chat_response: ChatResponse = response.json().ok()?;
     chat_response.choices.first().map(|c| c.message.content.clone())
 }
 
-/// Enhance audio quality before transcription.
-/// Ported from Ito's audio preprocessing pipeline.
-/// - Removes DC offset
-/// - Applies high-pass filter (~80 Hz) to remove rumble
-/// - Peak normalizes to ~-3 dBFS with capped gain
+// ============================================================================
+// Audio encoding (for Groq fallback only)
+// ============================================================================
+
 fn enhance_audio(samples: &[f32], sample_rate: u32) -> Vec<f32> {
     if samples.is_empty() {
         return Vec::new();
     }
-
-    // 1. DC offset removal
     let mean: f32 = samples.iter().sum::<f32>() / samples.len() as f32;
     let dc_removed: Vec<f32> = samples.iter().map(|&s| s - mean).collect();
-
-    // 2. High-pass filter (~80 Hz) - first-order filter
     let fc = 80.0_f32;
     let a = (-2.0 * std::f32::consts::PI * fc / sample_rate as f32).exp();
-
     let mut filtered = Vec::with_capacity(dc_removed.len());
     let mut prev_x = 0.0_f32;
     let mut prev_y = 0.0_f32;
-
     for &x in &dc_removed {
         let y = a * (prev_y + x - prev_x);
         filtered.push(y);
         prev_x = x;
         prev_y = y;
     }
-
-    // 3. Peak normalization to ~-3 dBFS, cap max gain to +12 dB
     let peak = filtered.iter().map(|&s| s.abs()).fold(1.0_f32, f32::max);
-    let target = 0.707_f32; // ~-3 dBFS (0.707 ≈ 10^(-3/20))
+    let target = 0.707_f32;
     let raw_gain = target / peak;
-    let gain = raw_gain.min(4.0); // Cap at ~+12 dB
-
-    // Apply gain only if it would make a meaningful difference
+    let gain = raw_gain.min(4.0);
     if gain > 1.05 {
         filtered.iter().map(|&s| (s * gain).clamp(-1.0, 1.0)).collect()
     } else {
@@ -625,16 +836,13 @@ fn enhance_audio(samples: &[f32], sample_rate: u32) -> Vec<f32> {
 }
 
 fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, hound::Error> {
-    // Enhance audio before encoding
     let enhanced = enhance_audio(samples, sample_rate);
-
     let spec = WavSpec {
         channels: 1,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut writer = WavWriter::new(&mut cursor, spec)?;
@@ -644,6 +852,5 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, hound::Error
         }
         writer.finalize()?;
     }
-
     Ok(cursor.into_inner())
 }

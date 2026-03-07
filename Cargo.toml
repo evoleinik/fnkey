@@ -1,6 +1,6 @@
 [package]
 name = "fnkey"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Hold Fn key, speak, paste transcribed text"
 license = "GPL-3.0"
@@ -16,15 +16,18 @@ core-graphics = "0.24"
 # Audio
 cpal = "0.15"
 
-# HTTP client
+# HTTP client (for Groq fallback + polish)
 reqwest = { version = "0.12", features = ["blocking", "multipart", "json"] }
+
+# WebSocket (for Deepgram streaming)
+tungstenite = { version = "0.24", features = ["native-tls"] }
 
 # Clipboard
 arboard = "3.4"
 
-# Audio encoding
+# Audio encoding (Groq fallback)
 hound = "3.5"
 
-# JSON parsing for LLM API
+# JSON
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
