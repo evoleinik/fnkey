@@ -14,12 +14,17 @@ Hold Fn key, speak, paste transcribed text.
    mv FnKey.app /Applications/
    ```
 
-3. Set your Groq API key:
+3. Set your API key(s):
    ```bash
    mkdir -p ~/.config/fnkey
-   echo 'your-groq-api-key' > ~/.config/fnkey/api_key
+
+   # Deepgram (streaming, recommended) — $200 free credit
+   echo 'your-deepgram-key' > ~/.config/fnkey/deepgram_key
+
+   # Groq (batch fallback + Fn+Ctrl polish)
+   echo 'your-groq-key' > ~/.config/fnkey/api_key
    ```
-   Get a key at [console.groq.com](https://console.groq.com)
+   Get keys at [console.deepgram.com](https://console.deepgram.com) and [console.groq.com](https://console.groq.com)
 
 4. Launch:
    ```bash
@@ -45,6 +50,15 @@ Hold Fn key, speak, paste transcribed text.
 
 The icon changes: ○ (idle) → ● (recording)
 
+## Transcription Backends
+
+| Backend | Mode | Config file | How it works |
+|---------|------|-------------|--------------|
+| **Deepgram Nova-3** | Streaming | `deepgram_key` | Audio streams via WebSocket while you speak. Fastest. |
+| **Groq Whisper** | Batch | `api_key` | Full clip sent after release. Fallback if no Deepgram key. |
+
+If both keys are configured, Deepgram streaming is used for transcription and Groq is used for Fn+Ctrl polish (Llama 3.3).
+
 ## Build from source
 
 ```bash
@@ -56,18 +70,20 @@ Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.
 
 ## Features
 
-- **Whisper large-v3** - Full model for best accuracy
-- **Audio enhancement** - DC offset removal, high-pass filter, peak normalization
-- **Config file** - API key stored in `~/.config/fnkey/api_key`
-- **Auto sample rate** - Uses device's native sample rate
+- **Real-time streaming** - Audio streams to Deepgram as you speak (no waiting)
+- **Deepgram Nova-3** - Latest model with smart formatting and punctuation
+- **Groq fallback** - Whisper large-v3 batch mode if Deepgram unavailable
+- **Polish mode** - Fn+Ctrl cleans up filler words via Llama 3.3
+- **Audio enhancement** - DC offset removal, high-pass filter, peak normalization (Groq mode)
+- **Auto sample rate** - Uses device's native sample rate, resamples to 16kHz for Deepgram
+- **Non-blocking** - WebSocket connects in background, never freezes the app
 
 ## TODO
-
-Features from Ito not yet implemented:
 
 - **Vocabulary hints** - Send prompt with proper nouns/technical terms to improve accuracy
 - **No-speech detection** - Use `verbose_json` response format and check `no_speech_prob` to skip silent recordings
 - **Custom dictionary** - User-configurable word list for domain-specific terms
+- **Backend toggle** - Menu bar option to switch between Deepgram and Groq
 
 ## Notes
 
