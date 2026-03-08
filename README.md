@@ -21,7 +21,7 @@ Hold Fn key, speak, paste transcribed text.
    # Deepgram (streaming, recommended) — $200 free credit
    echo 'your-deepgram-key' > ~/.config/fnkey/deepgram_key
 
-   # Groq (batch fallback + Fn+Ctrl polish)
+   # Groq (batch fallback if no Deepgram key)
    echo 'your-groq-key' > ~/.config/fnkey/api_key
    ```
    Get keys at [console.deepgram.com](https://console.deepgram.com) and [console.groq.com](https://console.groq.com)
@@ -39,12 +39,11 @@ Hold Fn key, speak, paste transcribed text.
    | **Microphone** | Record voice | Prompted on first use, or add manually |
    | **Accessibility** | Auto-paste text | Add FnKey.app via + button |
 
-   Note: After rebuilding the app, you may need to remove and re-add it in these settings.
+   Build script preserves permissions across rebuilds when using `./build-app.sh`.
 
 ## Usage
 
-- Hold **Fn** and speak → raw transcription
-- Hold **Fn+Ctrl** and speak → polished transcription (removes filler words, improves sentence structure)
+- Hold **Fn** and speak → transcription
 - Release to transcribe and paste
 - Click menu bar icon (○) to toggle **Press Return after paste** (sends Return key after pasting)
 - Click menu bar icon (○) → Quit to exit
@@ -58,7 +57,7 @@ The icon changes: ○ (idle) → ● (recording)
 | **Deepgram Nova-3** | Streaming | `deepgram_key` | Audio streams via WebSocket while you speak. Fastest. |
 | **Groq Whisper** | Batch | `api_key` | Full clip sent after release. Fallback if no Deepgram key. |
 
-If both keys are configured, Deepgram streaming is used for transcription and Groq is used for Fn+Ctrl polish (Llama 3.3).
+If both keys are configured, Deepgram streaming is preferred.
 
 ## Build from source
 
@@ -75,7 +74,6 @@ Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.
 - **Real-time streaming** - Audio streams to Deepgram as you speak (no waiting)
 - **Deepgram Nova-3** - Latest model with smart formatting and punctuation
 - **Groq fallback** - Whisper large-v3 batch mode if Deepgram unavailable
-- **Polish mode** - Fn+Ctrl cleans up filler words via Llama 3.3
 - **Audio enhancement** - DC offset removal, high-pass filter, peak normalization (Groq mode)
 - **Auto sample rate** - Uses device's native sample rate, resamples to 16kHz for Deepgram
 - **Non-blocking** - WebSocket connects in background, never freezes the app
@@ -91,7 +89,6 @@ Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.
 ## Notes
 
 - Falls back to Option key if Fn not detected after 5s
-- Floating red dot appears during recording
 
 ## Known Limitations
 

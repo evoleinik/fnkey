@@ -119,7 +119,6 @@ fn get_paste_keycode() -> u16 {
 
 const FN_KEY_FLAG: u64 = 0x800000;
 const OPTION_KEY_FLAG: u64 = 0x80000;
-const CONTROL_KEY_FLAG: u64 = 0x40000;
 const DEEPGRAM_SAMPLE_RATE: u32 = 16000;
 
 /// Messages sent from audio callback / event tap to the WebSocket thread
@@ -127,7 +126,7 @@ enum WsCommand {
     /// Raw PCM audio chunk (already resampled to 16kHz, i16 LE bytes)
     Audio(Vec<u8>),
     /// Stop streaming, finalize, paste result
-    Stop { polish: bool },
+    Stop,
 }
 
 struct AppState {
@@ -212,7 +211,6 @@ fn main() {
 fn spawn_deepgram_thread(
     key: String,
     rx: mpsc::Receiver<WsCommand>,
-    groq_key: Option<String>,
 ) {
     thread::spawn(move || {
         let url = format!(
@@ -260,7 +258,7 @@ fn spawn_deepgram_thread(
                 Ok(WsCommand::Audio(bytes)) => {
                     let _ = ws.send(Message::Binary(bytes));
                 }
-                Ok(WsCommand::Stop { polish }) => {
+                Ok(WsCommand::Stop) => {
                     // Send CloseStream, then drain remaining transcripts
                     let close_msg = serde_json::json!({"type": "CloseStream"});
                     let _ = ws.send(Message::Text(close_msg.to_string()));
@@ -288,17 +286,8 @@ fn spawn_deepgram_thread(
 
                     let text = transcript.trim().to_string();
                     if !text.is_empty() {
-                        let final_text = if polish {
-                            if let Some(ref gk) = groq_key {
-                                polish_text(&text, gk).unwrap_or(text)
-                            } else {
-                                text
-                            }
-                        } else {
-                            text
-                        };
                         if let Ok(mut clipboard) = Clipboard::new() {
-                            if clipboard.set_text(&final_text).is_ok() {
+                            if clipboard.set_text(&text).is_ok() {
                                 paste_and_maybe_return();
                             }
                         }
@@ -501,8 +490,7 @@ fn start_recording(state: &Arc<AppState>) {
         state.ws_active.store(true, Ordering::SeqCst);
 
         let key = dg_key.clone();
-        let groq_key = state.groq_key.clone();
-        spawn_deepgram_thread(key, rx, groq_key);
+        spawn_deepgram_thread(key, rx);
 
         // Spawn audio forwarder: drains buffer, resamples, sends to WS thread
         let buffer = Arc::clone(&state.audio_buffer);
@@ -545,7 +533,7 @@ fn start_recording(state: &Arc<AppState>) {
 }
 
 /// Called from event tap — must be non-blocking
-fn stop_recording(state: &Arc<AppState>, polish: bool) {
+fn stop_recording(state: &Arc<AppState>) {
     // Pause audio
     unsafe {
         if let Some(ref s) = AUDIO_STREAM {
@@ -584,7 +572,7 @@ fn stop_recording(state: &Arc<AppState>, polish: bool) {
                 let _ = tx.send(WsCommand::Audio(bytes));
             }
             // Tell WS thread to finalize
-            let _ = tx.send(WsCommand::Stop { polish });
+            let _ = tx.send(WsCommand::Stop);
             // tx drops here, which will also signal the thread
         }
     } else {
@@ -601,13 +589,8 @@ fn stop_recording(state: &Arc<AppState>, polish: bool) {
         thread::spawn(move || {
             if let Some(ref key) = groq_key {
                 if let Some(text) = transcribe_groq(audio_data, sample_rate, key) {
-                    let final_text = if polish {
-                        polish_text(&text, key).unwrap_or(text)
-                    } else {
-                        text
-                    };
                     if let Ok(mut clipboard) = Clipboard::new() {
-                        if clipboard.set_text(&final_text).is_ok() {
+                        if clipboard.set_text(&text).is_ok() {
                             paste_and_maybe_return();
                         }
                     }
@@ -743,11 +726,9 @@ fn run_event_tap(state: Arc<AppState>) {
     let state_for_callback = Arc::clone(&state);
     let fn_detected = Arc::new(AtomicBool::new(false));
     let was_pressed = Arc::new(AtomicBool::new(false));
-    let ctrl_was_held = Arc::new(AtomicBool::new(false));
 
     let fn_detected_clone = Arc::clone(&fn_detected);
     let was_pressed_clone = Arc::clone(&was_pressed);
-    let ctrl_latched_clone = Arc::clone(&ctrl_was_held);
 
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
@@ -758,7 +739,6 @@ fn run_event_tap(state: Arc<AppState>) {
             let flags = event.get_flags().bits();
             let fn_pressed = (flags & FN_KEY_FLAG) != 0;
             let option_pressed = (flags & OPTION_KEY_FLAG) != 0;
-            let ctrl_pressed = (flags & CONTROL_KEY_FLAG) != 0;
             let use_fn = state_for_callback.use_fn_key.load(Ordering::SeqCst);
             let key_pressed = if use_fn { fn_pressed } else { option_pressed };
 
@@ -769,15 +749,9 @@ fn run_event_tap(state: Arc<AppState>) {
             let prev_pressed = was_pressed_clone.load(Ordering::SeqCst);
 
             if key_pressed && !prev_pressed {
-                ctrl_latched_clone.store(false, Ordering::SeqCst);
                 start_recording(&state_for_callback);
             } else if !key_pressed && prev_pressed {
-                let polish = ctrl_latched_clone.load(Ordering::SeqCst);
-                stop_recording(&state_for_callback, polish);
-            }
-
-            if key_pressed && ctrl_pressed {
-                ctrl_latched_clone.store(true, Ordering::SeqCst);
+                stop_recording(&state_for_callback);
             }
 
             was_pressed_clone.store(key_pressed, Ordering::SeqCst);
@@ -833,51 +807,6 @@ fn paste_and_maybe_return() {
         thread::sleep(Duration::from_millis(50));
         press_return();
     }
-}
-
-// ============================================================================
-// LLM Polish (kept on Groq - fast and cheap)
-// ============================================================================
-
-#[derive(serde::Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(serde::Deserialize)]
-struct ChatChoice {
-    message: ChatMessage,
-}
-
-#[derive(serde::Deserialize)]
-struct ChatMessage {
-    content: String,
-}
-
-fn polish_text(text: &str, api_key: &str) -> Option<String> {
-    let client = reqwest::blocking::Client::new();
-    let body = serde_json::json!({
-        "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {
-                "role": "system",
-                "content": "Clean up this voice message for texting. Remove filler words (um, uh, like, you know). Fix punctuation and sentence structure. Break up run-on sentences. Keep it casual. No trailing period. Output ONLY the cleaned text - no explanations, no quotes."
-            },
-            { "role": "user", "content": text }
-        ],
-        "temperature": 0.2
-    });
-    let response = client
-        .post("https://api.groq.com/openai/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .ok()?;
-    if !response.status().is_success() { return None; }
-    let chat_response: ChatResponse = response.json().ok()?;
-    chat_response.choices.first().map(|c| c.message.content.clone())
 }
 
 // ============================================================================
