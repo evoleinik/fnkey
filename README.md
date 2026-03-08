@@ -46,6 +46,7 @@ Hold Fn key, speak, paste transcribed text.
 - Hold **Fn** and speak → raw transcription
 - Hold **Fn+Ctrl** and speak → polished transcription (removes filler words, improves sentence structure)
 - Release to transcribe and paste
+- Click menu bar icon (○) to toggle **Press Return after paste** (sends Return key after pasting)
 - Click menu bar icon (○) → Quit to exit
 
 The icon changes: ○ (idle) → ● (recording)
@@ -63,8 +64,9 @@ If both keys are configured, Deepgram streaming is used for transcription and Gr
 
 ```bash
 ./build-app.sh
-cp -r FnKey.app /Applications/
 ```
+
+This builds and installs directly to `/Applications/FnKey.app`, preserving permissions across rebuilds.
 
 Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.sh'`
 
@@ -77,6 +79,7 @@ Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.
 - **Audio enhancement** - DC offset removal, high-pass filter, peak normalization (Groq mode)
 - **Auto sample rate** - Uses device's native sample rate, resamples to 16kHz for Deepgram
 - **Non-blocking** - WebSocket connects in background, never freezes the app
+- **Auto-return mode** - Optional Return keypress after paste (toggle in menu bar)
 
 ## TODO
 

@@ -30,7 +30,8 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 use hound::{WavSpec, WavWriter};
-use objc::runtime::Object;
+use objc::declare::ClassDecl;
+use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 use tungstenite::protocol::Message;
 
@@ -143,6 +144,8 @@ struct AppState {
 
 static mut STATUS_ITEM: *mut Object = std::ptr::null_mut();
 static mut AUDIO_STREAM: Option<Stream> = None;
+static AUTO_RETURN: AtomicBool = AtomicBool::new(false);
+static mut AUTO_RETURN_ITEM: *mut Object = std::ptr::null_mut();
 
 fn read_config_file(name: &str) -> Option<String> {
     let home = env::var_os("HOME")?;
@@ -170,6 +173,11 @@ fn main() {
 
     if !check_input_monitoring_permission() {
         std::process::exit(1);
+    }
+
+    // Load auto-return preference
+    if read_config_file("auto_return").map_or(false, |v| v == "1") {
+        AUTO_RETURN.store(true, Ordering::SeqCst);
     }
 
     let state = Arc::new(AppState {
@@ -291,7 +299,7 @@ fn spawn_deepgram_thread(
                         };
                         if let Ok(mut clipboard) = Clipboard::new() {
                             if clipboard.set_text(&final_text).is_ok() {
-                                paste_with_cgevent();
+                                paste_and_maybe_return();
                             }
                         }
                     }
@@ -600,7 +608,7 @@ fn stop_recording(state: &Arc<AppState>, polish: bool) {
                     };
                     if let Ok(mut clipboard) = Clipboard::new() {
                         if clipboard.set_text(&final_text).is_ok() {
-                            paste_with_cgevent();
+                            paste_and_maybe_return();
                         }
                     }
                 }
@@ -647,7 +655,40 @@ fn show_alert(title: &str, message: &str) {
     }
 }
 
+extern "C" fn toggle_auto_return(_this: &Object, _cmd: Sel, _sender: id) {
+    let new_val = !AUTO_RETURN.load(Ordering::SeqCst);
+    AUTO_RETURN.store(new_val, Ordering::SeqCst);
+    unsafe {
+        if !AUTO_RETURN_ITEM.is_null() {
+            let state: i64 = if new_val { 1 } else { 0 };
+            let _: () = msg_send![AUTO_RETURN_ITEM as id, setState: state];
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let path = std::path::Path::new(&home).join(".config").join("fnkey").join("auto_return");
+        if new_val {
+            let _ = std::fs::write(&path, "1");
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+fn register_menu_handler_class() {
+    let superclass = Class::get("NSObject").unwrap();
+    let mut decl = ClassDecl::new("FnKeyMenuHandler", superclass).unwrap();
+    unsafe {
+        decl.add_method(
+            sel!(toggleAutoReturn:),
+            toggle_auto_return as extern "C" fn(&Object, Sel, id),
+        );
+    }
+    decl.register();
+}
+
 unsafe fn create_status_item() {
+    register_menu_handler_class();
+
     let status_bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
     let status_item: id = msg_send![status_bar, statusItemWithLength: -1.0_f64];
     let _: () = msg_send![status_item, retain];
@@ -656,6 +697,27 @@ unsafe fn create_status_item() {
     let button: id = msg_send![status_item, button];
     let _: () = msg_send![button, setTitle: title];
     let menu: id = NSMenu::new(nil);
+
+    // Auto Return toggle
+    let handler_class = Class::get("FnKeyMenuHandler").unwrap();
+    let handler: id = msg_send![handler_class, new];
+    let _: () = msg_send![handler, retain];
+    let auto_return_title = NSString::alloc(nil).init_str("Press Return after paste");
+    let empty_key = NSString::alloc(nil).init_str("");
+    let auto_return_item: id = msg_send![class!(NSMenuItem), alloc];
+    let auto_return_item: id = msg_send![auto_return_item, initWithTitle: auto_return_title action: sel!(toggleAutoReturn:) keyEquivalent: empty_key];
+    let _: () = msg_send![auto_return_item, setTarget: handler];
+    if AUTO_RETURN.load(Ordering::SeqCst) {
+        let _: () = msg_send![auto_return_item, setState: 1_i64];
+    }
+    AUTO_RETURN_ITEM = auto_return_item as *mut Object;
+    let _: () = msg_send![menu, addItem: auto_return_item];
+
+    // Separator
+    let separator: id = msg_send![class!(NSMenuItem), separatorItem];
+    let _: () = msg_send![menu, addItem: separator];
+
+    // Quit
     let quit_title = NSString::alloc(nil).init_str("Quit FnKey");
     let quit_key = NSString::alloc(nil).init_str("q");
     let quit_item: id = msg_send![class!(NSMenuItem), alloc];
@@ -755,6 +817,21 @@ fn paste_with_cgevent() {
                 key_up.post(CGEventTapLocation::HID);
             }
         }
+    }
+}
+
+fn press_return() {
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to key code 36")
+        .output();
+}
+
+fn paste_and_maybe_return() {
+    paste_with_cgevent();
+    if AUTO_RETURN.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(50));
+        press_return();
     }
 }
 

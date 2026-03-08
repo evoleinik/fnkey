@@ -10,21 +10,19 @@ export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
 echo "Building fnkey..."
 cargo build --release
 
-echo "Creating app bundle..."
-rm -rf "$BUNDLE_DIR"
-mkdir -p "$BUNDLE_DIR/Contents/MacOS"
-mkdir -p "$BUNDLE_DIR/Contents/Resources"
+INSTALL_DIR="/Applications/$BUNDLE_DIR"
 
-cp target/release/fnkey "$BUNDLE_DIR/Contents/MacOS/"
-cp Info.plist "$BUNDLE_DIR/Contents/"
+echo "Installing to $INSTALL_DIR..."
+mkdir -p "$INSTALL_DIR/Contents/MacOS"
+mkdir -p "$INSTALL_DIR/Contents/Resources"
+
+cp target/release/fnkey "$INSTALL_DIR/Contents/MacOS/"
+cp Info.plist "$INSTALL_DIR/Contents/"
 
 echo "Signing app..."
-codesign --force --deep --sign "FnKey Dev" "$BUNDLE_DIR"
+codesign --force --deep --sign "FnKey Dev" "$INSTALL_DIR"
 
-echo "Done! App bundle created at: $BUNDLE_DIR"
-echo ""
-echo "To install:"
-echo "  cp -r $BUNDLE_DIR /Applications/"
+echo "Done!"
 echo ""
 echo "To run:"
-echo "  open /Applications/$BUNDLE_DIR"
+echo "  open $INSTALL_DIR"
