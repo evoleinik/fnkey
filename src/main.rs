@@ -804,6 +804,7 @@ fn press_return() {
 fn paste_and_maybe_return() {
     paste_with_cgevent();
     if AUTO_RETURN.load(Ordering::SeqCst) {
+        // Let the paste finish processing before sending Return
         thread::sleep(Duration::from_millis(50));
         press_return();
     }
