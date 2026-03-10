@@ -133,6 +133,7 @@ struct AppState {
     audio_buffer: Arc<Mutex<Vec<f32>>>,
     groq_key: Option<String>,
     deepgram_key: Option<String>,
+    keywords: Vec<String>,
     use_fn_key: AtomicBool,
     sample_rate: std::sync::atomic::AtomicU32,
     /// Channel to send commands to the active WebSocket thread
@@ -179,10 +180,22 @@ fn main() {
         AUTO_RETURN.store(true, Ordering::SeqCst);
     }
 
+    // Load custom keywords for transcription accuracy
+    let keywords = read_config_file("keywords")
+        .map(|content| {
+            content
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let state = Arc::new(AppState {
         audio_buffer: Arc::new(Mutex::new(Vec::new())),
         groq_key,
         deepgram_key,
+        keywords,
         use_fn_key: AtomicBool::new(true),
         sample_rate: std::sync::atomic::AtomicU32::new(48000),
         ws_tx: Mutex::new(None),
@@ -211,16 +224,19 @@ fn main() {
 fn spawn_deepgram_thread(
     key: String,
     rx: mpsc::Receiver<WsCommand>,
+    keywords: Vec<String>,
 ) {
     thread::spawn(move || {
-        let url = format!(
+        let mut url = format!(
             "wss://api.deepgram.com/v1/listen?\
              encoding=linear16&sample_rate={}&channels=1&\
              interim_results=true&endpointing=300&\
              punctuate=true&smart_format=true&model=nova-3",
             DEEPGRAM_SAMPLE_RATE
         );
-
+        for kw in &keywords {
+            url.push_str(&format!("&keyterm={}", urlencoding::encode(kw)));
+        }
         let request = tungstenite::http::Request::builder()
             .uri(&url)
             .header("Authorization", format!("Token {}", key))
@@ -366,10 +382,10 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 // Groq batch fallback
 // ============================================================================
 
-fn transcribe_groq(audio: Vec<f32>, sample_rate: u32, api_key: &str) -> Option<String> {
+fn transcribe_groq(audio: Vec<f32>, sample_rate: u32, api_key: &str, keywords: &[String]) -> Option<String> {
     let wav_data = encode_wav(&audio, sample_rate).ok()?;
     let client = reqwest::blocking::Client::new();
-    let form = reqwest::blocking::multipart::Form::new()
+    let mut form = reqwest::blocking::multipart::Form::new()
         .text("model", "whisper-large-v3")
         .text("response_format", "text")
         .part(
@@ -379,6 +395,9 @@ fn transcribe_groq(audio: Vec<f32>, sample_rate: u32, api_key: &str) -> Option<S
                 .mime_str("audio/wav")
                 .unwrap(),
         );
+    if !keywords.is_empty() {
+        form = form.text("prompt", keywords.join(", "));
+    }
     let response = client
         .post("https://api.groq.com/openai/v1/audio/transcriptions")
         .header("Authorization", format!("Bearer {}", api_key))
@@ -490,7 +509,8 @@ fn start_recording(state: &Arc<AppState>) {
         state.ws_active.store(true, Ordering::SeqCst);
 
         let key = dg_key.clone();
-        spawn_deepgram_thread(key, rx);
+        let kw = state.keywords.clone();
+        spawn_deepgram_thread(key, rx, kw);
 
         // Spawn audio forwarder: drains buffer, resamples, sends to WS thread
         let buffer = Arc::clone(&state.audio_buffer);
@@ -586,9 +606,10 @@ fn stop_recording(state: &Arc<AppState>) {
         }
         let sample_rate = state.sample_rate.load(Ordering::SeqCst);
         let groq_key = state.groq_key.clone();
+        let keywords = state.keywords.clone();
         thread::spawn(move || {
             if let Some(ref key) = groq_key {
-                if let Some(text) = transcribe_groq(audio_data, sample_rate, key) {
+                if let Some(text) = transcribe_groq(audio_data, sample_rate, key, &keywords) {
                     if let Ok(mut clipboard) = Clipboard::new() {
                         if clipboard.set_text(&text).is_ok() {
                             paste_and_maybe_return();
@@ -657,6 +678,21 @@ extern "C" fn toggle_auto_return(_this: &Object, _cmd: Sel, _sender: id) {
     }
 }
 
+extern "C" fn edit_keywords(_this: &Object, _cmd: Sel, _sender: id) {
+    if let Some(home) = env::var_os("HOME") {
+        let path = std::path::Path::new(&home)
+            .join(".config")
+            .join("fnkey")
+            .join("keywords");
+        // Create file with example if it doesn't exist
+        if !path.exists() {
+            let _ = std::fs::create_dir_all(path.parent().unwrap());
+            let _ = std::fs::write(&path, "# Custom keywords (one per line)\n# Improves transcription accuracy for these terms\nAnthropic\nClaude\n");
+        }
+        let _ = std::process::Command::new("open").arg("-t").arg(&path).spawn();
+    }
+}
+
 fn register_menu_handler_class() {
     let superclass = Class::get("NSObject").unwrap();
     let mut decl = ClassDecl::new("FnKeyMenuHandler", superclass).unwrap();
@@ -664,6 +700,10 @@ fn register_menu_handler_class() {
         decl.add_method(
             sel!(toggleAutoReturn:),
             toggle_auto_return as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(editKeywords:),
+            edit_keywords as extern "C" fn(&Object, Sel, id),
         );
     }
     decl.register();
@@ -695,6 +735,13 @@ unsafe fn create_status_item() {
     }
     AUTO_RETURN_ITEM = auto_return_item as *mut Object;
     let _: () = msg_send![menu, addItem: auto_return_item];
+
+    // Edit Keywords
+    let keywords_title = NSString::alloc(nil).init_str("Edit Keywords…");
+    let keywords_item: id = msg_send![class!(NSMenuItem), alloc];
+    let keywords_item: id = msg_send![keywords_item, initWithTitle: keywords_title action: sel!(editKeywords:) keyEquivalent: empty_key];
+    let _: () = msg_send![keywords_item, setTarget: handler];
+    let _: () = msg_send![menu, addItem: keywords_item];
 
     // Separator
     let separator: id = msg_send![class!(NSMenuItem), separatorItem];

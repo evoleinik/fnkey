@@ -46,6 +46,7 @@ Hold Fn key, speak, paste transcribed text.
 - Hold **Fn** and speak → transcription
 - Release to transcribe and paste
 - Click menu bar icon (○) to toggle **Press Return after paste** (sends Return key after pasting)
+- Click menu bar icon (○) → **Edit Keywords…** to add custom vocabulary (opens in default text editor)
 - Click menu bar icon (○) → Quit to exit
 
 The icon changes: ○ (idle) → ● (recording)
@@ -79,11 +80,26 @@ Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.
 - **Non-blocking** - WebSocket connects in background, never freezes the app
 - **Auto-return mode** - Optional Return keypress after paste (toggle in menu bar)
 
+## Custom Keywords
+
+Add words the transcription engine often gets wrong (proper nouns, technical terms):
+
+```bash
+# Edit via menu bar → "Edit Keywords…", or directly:
+cat > ~/.config/fnkey/keywords << 'EOF'
+# One term per line
+Anthropic
+Claude
+cron job
+Kubernetes
+EOF
+```
+
+Keywords are sent as `keyterm` to Deepgram (Nova-3) and as `prompt` hints to Groq/Whisper. Reloaded each recording session.
+
 ## TODO
 
-- **Vocabulary hints** - Send prompt with proper nouns/technical terms to improve accuracy
 - **No-speech detection** - Use `verbose_json` response format and check `no_speech_prob` to skip silent recordings
-- **Custom dictionary** - User-configurable word list for domain-specific terms
 - **Backend toggle** - Menu bar option to switch between Deepgram and Groq
 
 ## Notes
