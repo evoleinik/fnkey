@@ -2,6 +2,8 @@
 
 Hold Fn key, speak, paste transcribed text.
 
+![FnKey menu bar](menu.png)
+
 ## Install
 
 1. Download from [Releases](https://github.com/evoleinik/fnkey/releases):
