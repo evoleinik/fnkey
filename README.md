@@ -2,7 +2,7 @@
 
 A tiny Rust menu bar app for macOS. Hold Fn, speak, paste. No UI — just a menu bar icon and your voice.
 
-![FnKey menu bar](menu.png)
+![FnKey menu bar](menu-bar.png)
 
 ## Install
 
