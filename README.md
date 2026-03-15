@@ -1,4 +1,4 @@
-# fnkey.ai
+# FnKey.app
 
 A tiny Rust menu bar app for macOS. Hold Fn, speak, paste. No UI — just a menu bar icon and your voice.
 
