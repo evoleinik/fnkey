@@ -1,6 +1,6 @@
 # FnKey.app
 
-A tiny Rust menu bar app for macOS. Hold Fn, speak, paste. No UI — just a menu bar icon and your voice.
+A tiny Rust menu bar app for macOS. Hold Fn, speak, paste. Microphone is only active while you hold the key — you'll see the yellow mic indicator in macOS as confirmation.
 
 ![FnKey menu bar](menu-bar.png)
 
