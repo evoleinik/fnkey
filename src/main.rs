@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
 use std::io::Cursor;
+use std::io::Write as IoWrite;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -129,8 +130,18 @@ enum WsCommand {
     Stop,
 }
 
+/// Result from Deepgram streaming thread
+enum DgResult {
+    /// Transcription succeeded (may be empty string)
+    Ok(String),
+    /// Connection or streaming error
+    Err(String),
+}
+
 struct AppState {
     audio_buffer: Arc<Mutex<Vec<f32>>>,
+    /// Shadow buffer: keeps all audio for Groq fallback if Deepgram fails
+    shadow_buffer: Arc<Mutex<Vec<f32>>>,
     groq_key: Option<String>,
     deepgram_key: Option<String>,
     keywords: Vec<String>,
@@ -138,6 +149,8 @@ struct AppState {
     sample_rate: std::sync::atomic::AtomicU32,
     /// Channel to send commands to the active WebSocket thread
     ws_tx: Mutex<Option<mpsc::Sender<WsCommand>>>,
+    /// Channel to receive result from Deepgram thread
+    dg_result_rx: Mutex<Option<mpsc::Receiver<DgResult>>>,
     /// Whether a Deepgram stream is active
     ws_active: Arc<AtomicBool>,
 }
@@ -153,6 +166,28 @@ fn read_config_file(name: &str) -> Option<String> {
     let key = std::fs::read_to_string(&path).ok()?;
     let key = key.trim();
     if key.is_empty() { None } else { Some(key.to_string()) }
+}
+
+fn log_error(msg: &str) {
+    if let Some(home) = env::var_os("HOME") {
+        let path = std::path::Path::new(&home).join(".config").join("fnkey").join("error.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let _ = writeln!(f, "[{}] {}", now, msg);
+        }
+    }
+    eprintln!("[fnkey] {}", msg);
+}
+
+fn show_notification(msg: &str) {
+    let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(format!(
+            "display notification \"{}\" with title \"FnKey\"",
+            escaped
+        ))
+        .spawn();
 }
 
 fn main() {
@@ -193,12 +228,14 @@ fn main() {
 
     let state = Arc::new(AppState {
         audio_buffer: Arc::new(Mutex::new(Vec::new())),
+        shadow_buffer: Arc::new(Mutex::new(Vec::new())),
         groq_key,
         deepgram_key,
         keywords,
         use_fn_key: AtomicBool::new(true),
         sample_rate: std::sync::atomic::AtomicU32::new(48000),
         ws_tx: Mutex::new(None),
+        dg_result_rx: Mutex::new(None),
         ws_active: Arc::new(AtomicBool::new(false)),
     });
 
@@ -225,6 +262,7 @@ fn spawn_deepgram_thread(
     key: String,
     rx: mpsc::Receiver<WsCommand>,
     keywords: Vec<String>,
+    result_tx: mpsc::Sender<DgResult>,
 ) {
     thread::spawn(move || {
         let mut url = format!(
@@ -251,7 +289,9 @@ fn spawn_deepgram_thread(
         let (mut ws, _response) = match tungstenite::connect(request) {
             Ok(pair) => pair,
             Err(e) => {
-                eprintln!("[fnkey] Deepgram connect failed: {}", e);
+                let msg = format!("Deepgram connect failed: {}", e);
+                log_error(&msg);
+                let _ = result_tx.send(DgResult::Err(msg));
                 // Drain remaining commands so senders don't block
                 for _ in rx.iter() {}
                 return;
@@ -267,12 +307,18 @@ fn spawn_deepgram_thread(
 
         let mut transcript = String::new();
         let mut running = true;
+        let mut ws_error: Option<String> = None;
 
         while running {
             // 1. Check for commands from audio callback / event tap
             match rx.try_recv() {
                 Ok(WsCommand::Audio(bytes)) => {
-                    let _ = ws.send(Message::Binary(bytes));
+                    if let Err(e) = ws.send(Message::Binary(bytes)) {
+                        let msg = format!("Deepgram send error: {}", e);
+                        log_error(&msg);
+                        ws_error = Some(msg);
+                        running = false;
+                    }
                 }
                 Ok(WsCommand::Stop) => {
                     // Send CloseStream, then drain remaining transcripts
@@ -299,19 +345,11 @@ fn spawn_deepgram_thread(
                         }
                     }
                     let _ = ws.close(None);
-
-                    let text = transcript.trim().to_string();
-                    if !text.is_empty() {
-                        if let Ok(mut clipboard) = Clipboard::new() {
-                            if clipboard.set_text(&text).is_ok() {
-                                paste_and_maybe_return();
-                            }
-                        }
-                    }
                     running = false;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    ws_error = Some("Deepgram: channel disconnected".to_string());
                     running = false;
                 }
             }
@@ -326,7 +364,10 @@ fn spawn_deepgram_thread(
                 }
                 Err(tungstenite::Error::Io(ref e))
                     if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => {
+                Err(e) => {
+                    let msg = format!("Deepgram WebSocket error: {}", e);
+                    log_error(&msg);
+                    ws_error = Some(msg);
                     running = false;
                 }
                 _ => {}
@@ -334,6 +375,16 @@ fn spawn_deepgram_thread(
 
             // Small sleep to avoid busy-spinning
             thread::sleep(Duration::from_millis(5));
+        }
+
+        // Send result back — if we got a transcript, use it even if WS errored
+        let text = transcript.trim().to_string();
+        if !text.is_empty() {
+            let _ = result_tx.send(DgResult::Ok(text));
+        } else if let Some(err) = ws_error {
+            let _ = result_tx.send(DgResult::Err(err));
+        } else {
+            let _ = result_tx.send(DgResult::Ok(String::new()));
         }
     });
 }
@@ -435,32 +486,7 @@ fn init_audio_stream(state: &Arc<AppState>) {
     };
 
     let buffer = Arc::clone(&state.audio_buffer);
-    let ws_active = Arc::clone(&state.ws_active);
-    let ws_tx: Arc<Mutex<Option<mpsc::Sender<WsCommand>>>> = Arc::new(Mutex::new(None));
-
-    // Store a reference so start_recording can update the sender
-    // We'll use a different approach: read ws_tx from state each time
-    let state_ws_tx = state.ws_tx.lock().unwrap().clone();
-    // Actually, we need the audio callback to access the current ws_tx.
-    // Since ws_tx changes each recording session, we need a shared reference.
-    // Let's use an Arc<Mutex<Option<Sender>>> that the callback reads from.
-    let tx_for_callback: Arc<Mutex<Option<mpsc::Sender<WsCommand>>>> = Arc::new(Mutex::new(None));
-    // Store this so start_recording can update it
-    // Hmm, this gets tricky. Let me use a simpler approach:
-    // The audio callback always buffers. A separate "forwarder" thread reads
-    // the buffer periodically and sends to WS. But that adds latency.
-    //
-    // Better: store the sender in state, audio callback reads from state.
-    drop(state_ws_tx);
-
-    let state_ref = Arc::clone(&state.ws_active); // just for the closure
-    let sr = actual_sample_rate;
-
-    // We need access to state.ws_tx from the audio callback.
-    // But state isn't available here... let's pass it differently.
-    // Actually, let's just buffer audio and have a forwarder thread.
-    // The forwarder drains the buffer every 20ms and sends to WS.
-    // This adds max 20ms latency which is fine for speech.
+    let shadow = Arc::clone(&state.shadow_buffer);
 
     let stream = device
         .build_input_stream(
@@ -468,8 +494,12 @@ fn init_audio_stream(state: &Arc<AppState>) {
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 let mut buf = buffer.lock().unwrap();
                 buf.extend_from_slice(data);
+                let mut shd = shadow.lock().unwrap();
+                shd.extend_from_slice(data);
             },
-            |err| eprintln!("Audio error: {}", err),
+            |err| {
+                log_error(&format!("Audio error: {}", err));
+            },
             None,
         )
         .ok();
@@ -481,10 +511,14 @@ fn init_audio_stream(state: &Arc<AppState>) {
 
 /// Called from event tap — must be non-blocking
 fn start_recording(state: &Arc<AppState>) {
-    // Clear buffer
+    // Clear buffers
     {
         let mut buffer = state.audio_buffer.lock().unwrap();
         buffer.clear();
+    }
+    {
+        let mut shadow = state.shadow_buffer.lock().unwrap();
+        shadow.clear();
     }
 
     // Init audio stream on first use
@@ -502,15 +536,20 @@ fn start_recording(state: &Arc<AppState>) {
     // Spawn Deepgram streaming in background (non-blocking)
     if let Some(ref dg_key) = state.deepgram_key {
         let (tx, rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
         {
             let mut ws_tx = state.ws_tx.lock().unwrap();
             *ws_tx = Some(tx);
+        }
+        {
+            let mut drx = state.dg_result_rx.lock().unwrap();
+            *drx = Some(result_rx);
         }
         state.ws_active.store(true, Ordering::SeqCst);
 
         let key = dg_key.clone();
         let kw = state.keywords.clone();
-        spawn_deepgram_thread(key, rx, kw);
+        spawn_deepgram_thread(key, rx, kw, result_tx);
 
         // Spawn audio forwarder: drains buffer, resamples, sends to WS thread
         let buffer = Arc::clone(&state.audio_buffer);
@@ -565,11 +604,19 @@ fn stop_recording(state: &Arc<AppState>) {
 
     let was_streaming = state.ws_active.load(Ordering::SeqCst);
 
+    // Grab shadow buffer for potential Groq fallback
+    let shadow_audio: Vec<f32> = {
+        let shd = state.shadow_buffer.lock().unwrap();
+        shd.clone()
+    };
+    let sample_rate = state.sample_rate.load(Ordering::SeqCst);
+    let groq_key = state.groq_key.clone();
+    let keywords = state.keywords.clone();
+
     if was_streaming {
-        // Signal the WS thread to stop (it handles paste internally)
+        // Signal the WS thread to stop
         state.ws_active.store(false, Ordering::SeqCst);
 
-        // Small delay to let forwarder send remaining audio
         let ws_tx = state.ws_tx.lock().unwrap().take();
         if let Some(tx) = ws_tx {
             // Drain any remaining audio in the buffer
@@ -593,23 +640,67 @@ fn stop_recording(state: &Arc<AppState>) {
             }
             // Tell WS thread to finalize
             let _ = tx.send(WsCommand::Stop);
-            // tx drops here, which will also signal the thread
         }
+
+        // Wait for Deepgram result in background, fallback to Groq if needed
+        let result_rx = state.dg_result_rx.lock().unwrap().take();
+        thread::spawn(move || {
+            let dg_text = if let Some(rx) = result_rx {
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(DgResult::Ok(text)) if !text.is_empty() => Some(text),
+                    Ok(DgResult::Ok(_)) => {
+                        log_error("Deepgram: empty transcript");
+                        None
+                    }
+                    Ok(DgResult::Err(e)) => {
+                        log_error(&format!("Deepgram failed: {}", e));
+                        None
+                    }
+                    Err(_) => {
+                        log_error("Deepgram: timeout waiting for result");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(text) = dg_text {
+                // Deepgram succeeded
+                if let Ok(mut clipboard) = Clipboard::new() {
+                    if clipboard.set_text(&text).is_ok() {
+                        paste_and_maybe_return();
+                    }
+                }
+            } else if let Some(ref key) = groq_key {
+                if !shadow_audio.is_empty() {
+                    // Fallback to Groq
+                    show_notification("Deepgram failed, using Groq fallback");
+                    log_error("Falling back to Groq Whisper");
+                    if let Some(text) = transcribe_groq(shadow_audio, sample_rate, key, &keywords) {
+                        if let Ok(mut clipboard) = Clipboard::new() {
+                            if clipboard.set_text(&text).is_ok() {
+                                paste_and_maybe_return();
+                            }
+                        }
+                    } else {
+                        show_notification("Transcription failed (both backends)");
+                        log_error("Groq fallback also failed");
+                    }
+                }
+            } else if !shadow_audio.is_empty() {
+                show_notification("Deepgram failed, no Groq key for fallback");
+                log_error("Deepgram failed, no Groq key configured for fallback");
+            }
+        });
     } else {
-        // Groq batch fallback (in background thread)
-        let audio_data: Vec<f32> = {
-            let buffer = state.audio_buffer.lock().unwrap();
-            buffer.clone()
-        };
-        if audio_data.is_empty() {
+        // Groq-only mode (no Deepgram key configured)
+        if shadow_audio.is_empty() {
             return;
         }
-        let sample_rate = state.sample_rate.load(Ordering::SeqCst);
-        let groq_key = state.groq_key.clone();
-        let keywords = state.keywords.clone();
         thread::spawn(move || {
             if let Some(ref key) = groq_key {
-                if let Some(text) = transcribe_groq(audio_data, sample_rate, key, &keywords) {
+                if let Some(text) = transcribe_groq(shadow_audio, sample_rate, key, &keywords) {
                     if let Ok(mut clipboard) = Clipboard::new() {
                         if clipboard.set_text(&text).is_ok() {
                             paste_and_maybe_return();
