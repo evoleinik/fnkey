@@ -6,6 +6,8 @@ A tiny Rust menu bar app for macOS. Hold Fn, speak, paste. Microphone is only ac
 
 <p align="center"><img src="demo.gif" alt="FnKey demo" width="600"></p>
 
+If you find FnKey useful, please [star the repo](https://github.com/evoleinik/fnkey) — it helps others discover it.
+
 ## Install
 
 1. Download from [Releases](https://github.com/evoleinik/fnkey/releases):
