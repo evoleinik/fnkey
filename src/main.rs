@@ -180,14 +180,16 @@ fn log_error(msg: &str) {
 }
 
 fn show_notification(msg: &str) {
-    let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
-    let _ = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(format!(
-            "display notification \"{}\" with title \"FnKey\"",
-            escaped
-        ))
-        .spawn();
+    unsafe {
+        let _pool = NSAutoreleasePool::new(nil);
+        let center: id = msg_send![class!(NSUserNotificationCenter), defaultUserNotificationCenter];
+        let notification: id = msg_send![class!(NSUserNotification), new];
+        let title = NSString::alloc(nil).init_str("FnKey");
+        let body = NSString::alloc(nil).init_str(msg);
+        let _: () = msg_send![notification, setTitle: title];
+        let _: () = msg_send![notification, setInformativeText: body];
+        let _: () = msg_send![center, deliverNotification: notification];
+    }
 }
 
 fn main() {
