@@ -271,7 +271,8 @@ fn spawn_deepgram_thread(
             "wss://api.deepgram.com/v1/listen?\
              encoding=linear16&sample_rate={}&channels=1&\
              interim_results=true&endpointing=300&\
-             punctuate=true&smart_format=true&model=nova-3",
+             punctuate=true&smart_format=true&model=nova-3&\
+             language=multi",
             DEEPGRAM_SAMPLE_RATE
         );
         for kw in &keywords {
@@ -308,21 +309,39 @@ fn spawn_deepgram_thread(
         }
 
         let mut transcript = String::new();
+        let mut raw_msgs: Vec<String> = Vec::new();
         let mut running = true;
         let mut ws_error: Option<String> = None;
+        let started = std::time::Instant::now();
+        let mut chunks_sent: u32 = 0;
+        let mut bytes_sent: usize = 0;
+        let mut msgs_received: u32 = 0;
+        let mut got_stop = false;
 
         while running {
             // 1. Check for commands from audio callback / event tap
             match rx.try_recv() {
                 Ok(WsCommand::Audio(bytes)) => {
+                    let len = bytes.len();
                     if let Err(e) = ws.send(Message::Binary(bytes)) {
-                        let msg = format!("Deepgram send error: {}", e);
+                        // EAGAIN/WouldBlock = send buffer momentarily full, skip chunk
+                        if let tungstenite::Error::Io(ref io_err) = e {
+                            if io_err.kind() == std::io::ErrorKind::WouldBlock {
+                                continue;
+                            }
+                        }
+                        let msg = format!("Deepgram send error after {}ms, {} chunks/{}KB sent: {}",
+                            started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024, e);
                         log_error(&msg);
                         ws_error = Some(msg);
                         running = false;
+                    } else {
+                        chunks_sent += 1;
+                        bytes_sent += len;
                     }
                 }
                 Ok(WsCommand::Stop) => {
+                    got_stop = true;
                     // Send CloseStream, then drain remaining transcripts
                     let close_msg = serde_json::json!({"type": "CloseStream"});
                     let _ = ws.send(Message::Text(close_msg.to_string()));
@@ -340,9 +359,18 @@ fn spawn_deepgram_thread(
                     loop {
                         match ws.read() {
                             Ok(Message::Text(text)) => {
-                                accumulate_transcript(&text, &mut transcript);
+                                msgs_received += 1;
+                                accumulate_transcript(&text, &mut transcript, &mut raw_msgs);
                             }
-                            Ok(Message::Close(_)) | Err(_) => break,
+                            Ok(Message::Close(frame)) => {
+                                if let Some(ref f) = frame {
+                                    if f.code != tungstenite::protocol::frame::coding::CloseCode::Normal {
+                                        log_error(&format!("Deepgram close frame: code={}, reason='{}'", f.code, f.reason));
+                                    }
+                                }
+                                break;
+                            }
+                            Err(_) => break,
                             _ => {}
                         }
                     }
@@ -351,7 +379,8 @@ fn spawn_deepgram_thread(
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    ws_error = Some("Deepgram: channel disconnected".to_string());
+                    ws_error = Some(format!("Deepgram: channel disconnected after {}ms, {} chunks/{}KB sent",
+                        started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024));
                     running = false;
                 }
             }
@@ -359,15 +388,36 @@ fn spawn_deepgram_thread(
             // 2. Try to read transcript from WebSocket (non-blocking)
             match ws.read() {
                 Ok(Message::Text(text)) => {
-                    accumulate_transcript(&text, &mut transcript);
+                    msgs_received += 1;
+                    accumulate_transcript(&text, &mut transcript, &mut raw_msgs);
                 }
-                Ok(Message::Close(_)) => {
+                Ok(Message::Close(frame)) => {
+                    if !got_stop {
+                        // Server closed before we sent Stop — unexpected
+                        let reason = frame.as_ref()
+                            .map(|f| format!("code={}, reason='{}'", f.code, f.reason))
+                            .unwrap_or_else(|| "no close frame".to_string());
+                        let msg = format!("Deepgram server closed early after {}ms, {} chunks/{}KB sent, {} msgs recv'd: {}",
+                            started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024, msgs_received, reason);
+                        log_error(&msg);
+                        ws_error = Some(msg);
+                    }
                     running = false;
                 }
                 Err(tungstenite::Error::Io(ref e))
                     if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(tungstenite::Error::ConnectionClosed) => {
+                    if !got_stop {
+                        let msg = format!("Deepgram connection dropped after {}ms, {} chunks/{}KB sent, {} msgs recv'd",
+                            started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024, msgs_received);
+                        log_error(&msg);
+                        ws_error = Some(msg);
+                    }
+                    running = false;
+                }
                 Err(e) => {
-                    let msg = format!("Deepgram WebSocket error: {}", e);
+                    let msg = format!("Deepgram WebSocket error after {}ms, {} chunks/{}KB sent, {} msgs recv'd: {}",
+                        started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024, msgs_received, e);
                     log_error(&msg);
                     ws_error = Some(msg);
                     running = false;
@@ -386,12 +436,22 @@ fn spawn_deepgram_thread(
         } else if let Some(err) = ws_error {
             let _ = result_tx.send(DgResult::Err(err));
         } else {
-            let _ = result_tx.send(DgResult::Ok(String::new()));
+            let mut msg = format!(
+                "Deepgram: empty transcript after {}ms, {} chunks/{}KB sent, {} msgs recv'd",
+                started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024, msgs_received
+            );
+            // Log raw Deepgram responses so we can see what it actually sent
+            for (i, raw) in raw_msgs.iter().enumerate() {
+                msg.push_str(&format!("\n  msg[{}]: {}", i, raw));
+            }
+            log_error(&msg);
+            let _ = result_tx.send(DgResult::Err(msg.lines().next().unwrap_or(&msg).to_string()));
         }
     });
 }
 
-fn accumulate_transcript(json_text: &str, transcript: &mut String) {
+fn accumulate_transcript(json_text: &str, transcript: &mut String, raw_msgs: &mut Vec<String>) {
+    raw_msgs.push(json_text.to_string());
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_text) {
         let is_final = v.get("is_final").and_then(|f| f.as_bool()).unwrap_or(false);
         let text = v.get("channel")
