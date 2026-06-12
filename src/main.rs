@@ -6,13 +6,15 @@
 //! Config files (~/.config/fnkey/):
 //!   deepgram_key  - Deepgram API key (streaming, preferred)
 //!   api_key       - Groq API key (batch fallback + polish)
+//!   sixtydb_key   - 60db API key (text-to-speech, "Speak Clipboard" menu item)
+//!   sixtydb_voice - optional 60db voice_id for TTS
 
 use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
 use std::io::Cursor;
 use std::io::Write as IoWrite;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -28,6 +30,7 @@ use core_graphics::event::{
     CGEventType,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use base64::Engine as _;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 use hound::{WavSpec, WavWriter};
@@ -160,6 +163,11 @@ static mut AUDIO_STREAM: Option<Stream> = None;
 static AUTO_RETURN: AtomicBool = AtomicBool::new(false);
 static mut AUTO_RETURN_ITEM: *mut Object = std::ptr::null_mut();
 
+/// 60db TTS config, loaded once at startup. Read by the "Speak Clipboard" menu
+/// handler, which runs on the Obj-C main thread and has no access to AppState.
+static SIXTYDB_KEY: OnceLock<Option<String>> = OnceLock::new();
+static SIXTYDB_VOICE: OnceLock<Option<String>> = OnceLock::new();
+
 fn read_config_file(name: &str) -> Option<String> {
     let home = env::var_os("HOME")?;
     let path = std::path::Path::new(&home).join(".config").join("fnkey").join(name);
@@ -197,6 +205,12 @@ fn main() {
         .or_else(|| env::var("DEEPGRAM_API_KEY").ok());
     let groq_key = read_config_file("api_key")
         .or_else(|| env::var("GROQ_API_KEY").ok());
+
+    // 60db text-to-speech (optional, independent of the STT backends).
+    let _ = SIXTYDB_KEY.set(
+        read_config_file("sixtydb_key").or_else(|| env::var("SIXTYDB_API_KEY").ok()),
+    );
+    let _ = SIXTYDB_VOICE.set(read_config_file("sixtydb_voice"));
 
     if deepgram_key.is_none() && groq_key.is_none() {
         show_alert(
@@ -525,6 +539,268 @@ fn transcribe_groq(audio: Vec<f32>, sample_rate: u32, api_key: &str, keywords: &
 }
 
 // ============================================================================
+// Text-to-speech (TTS)
+//
+// The two STT backends above turn speech into text. TTS goes the other way —
+// text into audio — so it is a separate capability, not an interchangeable
+// alternative to Deepgram/Groq. A `TtsProvider` trait keeps the synthesis
+// backend swappable; 60db is the first (and currently only) implementation.
+// ============================================================================
+
+/// Decoded mono audio ready for playback.
+struct TtsAudio {
+    /// Mono samples in [-1.0, 1.0].
+    samples: Vec<f32>,
+    sample_rate: u32,
+}
+
+/// A text-to-speech backend. Implementations turn a string into playable audio.
+/// The rest of the app only depends on this trait, so additional providers can
+/// be added without touching the playback or UI code.
+trait TtsProvider {
+    fn name(&self) -> &'static str;
+    /// Synthesize `text` into mono audio, or return a human-readable error.
+    fn synthesize(&self, text: &str) -> Result<TtsAudio, String>;
+}
+
+/// Unique-per-process counter for 60db WebSocket context ids.
+static TTS_CONTEXT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 60db TTS over the WebSocket API (LINEAR16 PCM, lowest latency, no decoder
+/// needed — PCM feeds straight into cpal).
+///
+/// Protocol: connect (apiKey in query) → create_context → send_text →
+/// flush_context → receive `audio_chunk` frames → `flush_completed` →
+/// close_context.
+struct SixtyDbProvider {
+    api_key: String,
+    voice_id: Option<String>,
+}
+
+const SIXTYDB_TTS_SAMPLE_RATE: u32 = 24000;
+
+impl TtsProvider for SixtyDbProvider {
+    fn name(&self) -> &'static str {
+        "60db"
+    }
+
+    fn synthesize(&self, text: &str) -> Result<TtsAudio, String> {
+        let url = format!(
+            "wss://api.60db.ai/ws/tts?apiKey={}",
+            urlencoding::encode(&self.api_key)
+        );
+        let (mut ws, _resp) =
+            tungstenite::connect(url.as_str()).map_err(|e| format!("60db connect failed: {}", e))?;
+
+        // Bound the session so a stalled server can't hang the audio thread.
+        match ws.get_ref() {
+            tungstenite::stream::MaybeTlsStream::NativeTls(s) => {
+                let _ = s.get_ref().set_read_timeout(Some(Duration::from_secs(15)));
+            }
+            tungstenite::stream::MaybeTlsStream::Plain(s) => {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
+            }
+            _ => {}
+        }
+
+        let ctx = format!(
+            "fnkey-{}",
+            TTS_CONTEXT_COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+
+        let mut create = serde_json::json!({
+            "create_context": {
+                "context_id": ctx,
+                "audio_config": {
+                    "audio_encoding": "LINEAR16",
+                    "sample_rate_hertz": SIXTYDB_TTS_SAMPLE_RATE,
+                },
+                "speed": 1,
+                "stability": 50,
+                "similarity": 75,
+            }
+        });
+        if let Some(voice) = &self.voice_id {
+            create["create_context"]["voice_id"] = serde_json::json!(voice);
+        }
+        ws.send(Message::Text(create.to_string()))
+            .map_err(|e| format!("60db create_context failed: {}", e))?;
+        ws.send(Message::Text(
+            serde_json::json!({ "send_text": { "context_id": ctx, "text": text } }).to_string(),
+        ))
+        .map_err(|e| format!("60db send_text failed: {}", e))?;
+        ws.send(Message::Text(
+            serde_json::json!({ "flush_context": { "context_id": ctx } }).to_string(),
+        ))
+        .map_err(|e| format!("60db flush_context failed: {}", e))?;
+
+        let mut samples: Vec<f32> = Vec::new();
+        loop {
+            match ws.read() {
+                Ok(Message::Text(t)) => {
+                    let v: serde_json::Value = match serde_json::from_str(&t) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if let Some(b64) = v
+                        .get("audio_chunk")
+                        .and_then(|c| c.get("audioContent"))
+                        .and_then(|a| a.as_str())
+                    {
+                        append_linear16_base64(b64, &mut samples);
+                    } else if v.get("flush_completed").is_some() {
+                        break;
+                    } else if let Some(err) = v.get("error") {
+                        let msg = err
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("unknown error");
+                        return Err(format!("60db error: {}", msg));
+                    }
+                    // connection_established / context_created are ignored.
+                }
+                Ok(Message::Binary(b)) => {
+                    // Some deployments send raw LINEAR16 frames instead of base64.
+                    append_linear16_bytes(&b, &mut samples);
+                }
+                Ok(Message::Close(_)) => break,
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(ref e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // Read timeout: take whatever we have rather than hang.
+                    break;
+                }
+                Err(tungstenite::Error::ConnectionClosed) => break,
+                Err(e) => {
+                    if samples.is_empty() {
+                        return Err(format!("60db stream error: {}", e));
+                    }
+                    break;
+                }
+            }
+        }
+
+        let _ = ws.send(Message::Text(
+            serde_json::json!({ "close_context": { "context_id": ctx } }).to_string(),
+        ));
+        let _ = ws.close(None);
+
+        if samples.is_empty() {
+            return Err("60db: no audio received".to_string());
+        }
+        Ok(TtsAudio {
+            samples,
+            sample_rate: SIXTYDB_TTS_SAMPLE_RATE,
+        })
+    }
+}
+
+/// Decode a base64 LINEAR16 (16-bit signed LE PCM) chunk into f32 samples.
+fn append_linear16_base64(b64: &str, out: &mut Vec<f32>) {
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+        append_linear16_bytes(&bytes, out);
+    }
+}
+
+/// Decode raw LINEAR16 (16-bit signed LE PCM) bytes into f32 samples.
+fn append_linear16_bytes(bytes: &[u8], out: &mut Vec<f32>) {
+    out.reserve(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let s = i16::from_le_bytes([pair[0], pair[1]]);
+        out.push(s as f32 / 32768.0);
+    }
+}
+
+/// Play mono audio on the default output device, blocking until playback
+/// finishes. Resamples to the device rate and fans the mono signal out to all
+/// output channels. Intended to run on a background thread.
+fn play_audio(audio: TtsAudio) -> Result<(), String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or("no audio output device")?;
+    let supported = device
+        .default_output_config()
+        .map_err(|e| format!("output config: {}", e))?;
+    let out_rate = supported.sample_rate().0;
+    let channels = supported.channels() as usize;
+    let sample_format = supported.sample_format();
+    let config: cpal::StreamConfig = supported.config();
+
+    let data: Arc<Vec<f32>> = Arc::new(resample(&audio.samples, audio.sample_rate, out_rate));
+    let pos = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => {
+            build_playback_stream::<f32>(&device, &config, channels, data, pos, Arc::clone(&done))
+        }
+        cpal::SampleFormat::I16 => {
+            build_playback_stream::<i16>(&device, &config, channels, data, pos, Arc::clone(&done))
+        }
+        cpal::SampleFormat::U16 => {
+            build_playback_stream::<u16>(&device, &config, channels, data, pos, Arc::clone(&done))
+        }
+        other => return Err(format!("unsupported output format: {:?}", other)),
+    }?;
+
+    stream.play().map_err(|e| format!("playback: {}", e))?;
+
+    // Wait for the callback to drain the buffer (cap at 60s as a safety net).
+    let waited_start = std::time::Instant::now();
+    while !done.load(Ordering::SeqCst) && waited_start.elapsed() < Duration::from_secs(60) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Let the final buffer flush out of the device before dropping the stream.
+    thread::sleep(Duration::from_millis(80));
+    Ok(())
+}
+
+/// Build a typed cpal output stream that plays `data` (mono) once, then writes
+/// silence and flags `done`.
+fn build_playback_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    channels: usize,
+    data: Arc<Vec<f32>>,
+    pos: Arc<AtomicUsize>,
+    done: Arc<AtomicBool>,
+) -> Result<Stream, String>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let total = data.len();
+    device
+        .build_output_stream(
+            config,
+            move |out: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let p = pos.load(Ordering::SeqCst);
+                let frames = out.len() / channels.max(1);
+                for f in 0..frames {
+                    let idx = p + f;
+                    let sample = if idx < total { data[idx] } else { 0.0 };
+                    let value = T::from_sample(sample);
+                    for c in 0..channels {
+                        out[f * channels + c] = value;
+                    }
+                }
+                let next = p + frames;
+                pos.store(next, Ordering::SeqCst);
+                if next >= total {
+                    done.store(true, Ordering::SeqCst);
+                }
+            },
+            |err| log_error(&format!("TTS playback error: {}", err)),
+            None,
+        )
+        .map_err(|e| format!("build output stream: {}", e))
+}
+
+// ============================================================================
 // Recording lifecycle — all non-blocking from event tap's perspective
 // ============================================================================
 
@@ -846,6 +1122,60 @@ extern "C" fn edit_keywords(_this: &Object, _cmd: Sel, _sender: id) {
     }
 }
 
+/// Menu handler: synthesize the current clipboard text with 60db and play it.
+extern "C" fn speak_clipboard(_this: &Object, _cmd: Sel, _sender: id) {
+    let key = match SIXTYDB_KEY.get().and_then(|k| k.clone()) {
+        Some(k) => k,
+        None => {
+            show_alert(
+                "60db not configured",
+                "To use Speak Clipboard, save your 60db API key:\n\n\
+                 mkdir -p ~/.config/fnkey\n  echo 'your_key' > ~/.config/fnkey/sixtydb_key\n\n\
+                 Optionally set a voice with ~/.config/fnkey/sixtydb_voice.",
+            );
+            return;
+        }
+    };
+    let voice = SIXTYDB_VOICE.get().and_then(|v| v.clone());
+
+    let text = match Clipboard::new().ok().and_then(|mut c| c.get_text().ok()) {
+        Some(t) => t,
+        None => {
+            show_notification("Clipboard has no text to speak");
+            return;
+        }
+    };
+    if text.trim().is_empty() {
+        show_notification("Clipboard has no text to speak");
+        return;
+    }
+    // 60db caps text at 5000 characters per request.
+    let text: String = if text.chars().count() > 5000 {
+        text.chars().take(5000).collect()
+    } else {
+        text
+    };
+
+    thread::spawn(move || {
+        let provider = SixtyDbProvider {
+            api_key: key,
+            voice_id: voice,
+        };
+        match provider.synthesize(&text) {
+            Ok(audio) => {
+                if let Err(e) = play_audio(audio) {
+                    log_error(&format!("{} playback failed: {}", provider.name(), e));
+                    show_notification("TTS playback failed");
+                }
+            }
+            Err(e) => {
+                log_error(&format!("{} TTS failed: {}", provider.name(), e));
+                show_notification("60db TTS failed");
+            }
+        }
+    });
+}
+
 fn register_menu_handler_class() {
     let superclass = Class::get("NSObject").unwrap();
     let mut decl = ClassDecl::new("FnKeyMenuHandler", superclass).unwrap();
@@ -857,6 +1187,10 @@ fn register_menu_handler_class() {
         decl.add_method(
             sel!(editKeywords:),
             edit_keywords as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(speakClipboard:),
+            speak_clipboard as extern "C" fn(&Object, Sel, id),
         );
     }
     decl.register();
@@ -895,6 +1229,13 @@ unsafe fn create_status_item() {
     let keywords_item: id = msg_send![keywords_item, initWithTitle: keywords_title action: sel!(editKeywords:) keyEquivalent: empty_key];
     let _: () = msg_send![keywords_item, setTarget: handler];
     let _: () = msg_send![menu, addItem: keywords_item];
+
+    // Speak Clipboard (60db TTS)
+    let speak_title = NSString::alloc(nil).init_str("Speak Clipboard");
+    let speak_item: id = msg_send![class!(NSMenuItem), alloc];
+    let speak_item: id = msg_send![speak_item, initWithTitle: speak_title action: sel!(speakClipboard:) keyEquivalent: empty_key];
+    let _: () = msg_send![speak_item, setTarget: handler];
+    let _: () = msg_send![menu, addItem: speak_item];
 
     // Separator
     let separator: id = msg_send![class!(NSMenuItem), separatorItem];

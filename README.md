@@ -29,8 +29,13 @@ If you find FnKey useful, please [star the repo](https://github.com/evoleinik/fn
 
    # Groq (batch fallback if no Deepgram key)
    echo 'your-groq-key' > ~/.config/fnkey/api_key
+
+   # 60db (optional — text-to-speech for "Speak Clipboard")
+   echo 'your-60db-key' > ~/.config/fnkey/sixtydb_key
+   # Optional: pick a specific 60db voice
+   # echo 'your-voice-id' > ~/.config/fnkey/sixtydb_voice
    ```
-   Get keys at [console.deepgram.com](https://console.deepgram.com) and [console.groq.com](https://console.groq.com)
+   Get keys at [console.deepgram.com](https://console.deepgram.com), [console.groq.com](https://console.groq.com), and [60db.ai](https://60db.ai)
 
 4. Launch:
    ```bash
@@ -53,6 +58,7 @@ If you find FnKey useful, please [star the repo](https://github.com/evoleinik/fn
 - Release to transcribe and paste
 - Click menu bar icon (○) to toggle **Press Return after paste** (sends Return key after pasting)
 - Click menu bar icon (○) → **Edit Keywords…** to add custom vocabulary (opens in default text editor)
+- Click menu bar icon (○) → **Speak Clipboard** to read the current clipboard text aloud via 60db (requires `sixtydb_key`)
 - Click menu bar icon (○) → Quit to exit
 
 The icon changes: ○ (idle) → ● (recording)
@@ -65,6 +71,14 @@ The icon changes: ○ (idle) → ● (recording)
 | **Groq Whisper** | Batch | `api_key` | Full clip sent after release. Fallback if no Deepgram key. |
 
 If both keys are configured, Deepgram streaming is preferred.
+
+## Text-to-Speech (60db)
+
+Beyond dictation (speech → text), FnKey can also read text aloud (text → speech) via [60db](https://60db.ai). Copy any text, then click the menu bar icon → **Speak Clipboard**. Audio is synthesized over the 60db WebSocket API (LINEAR16 PCM) and played on your default output device.
+
+Set `~/.config/fnkey/sixtydb_key` (or the `SIXTYDB_API_KEY` env var) to enable it; optionally set `~/.config/fnkey/sixtydb_voice` to choose a voice. TTS is independent of the transcription backends — the app runs fine without a 60db key (the menu item simply prompts you to add one).
+
+The synthesis backend lives behind a `TtsProvider` trait in `src/main.rs`, so additional TTS providers can be added without touching the playback or UI code.
 
 ## Build from source
 
