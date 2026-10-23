@@ -86,6 +86,12 @@ with the fallback disabled once anything is pasted.
   about 1 dictation in 5.
 - 2026-10-23, Eugene (after first use): "It's pasting. It's very, very good." Asked for a menu toggle like
   "Press Return after paste". Also: "somehow it doesn't always work, or there is a delay."
+- 2026-10-23, Claude (measurement, the delay): a 30 s narration clip streamed from air to the India
+  region at real time, 2 runs, the same both times. Finals came every 3.3–5.0 s of continuous speech,
+  5–12 words each. 6 of 8 arrived within 0.3 s of the phrase's last word, and 2 lagged 1.2–1.8 s. A
+  100 ms pause rule finalized no sooner than 300 ms. So live text shows up in chunks of a sentence or
+  so. A dictation under about 4 s gets no early final and pastes only at release. That is Deepgram's
+  finalization, not a FnKey fault. The log showed no errors, timeouts or fallbacks in the live tests.
 
 ## Questions for Eugene
 
