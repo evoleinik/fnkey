@@ -52,6 +52,7 @@ If you find FnKey useful, please [star the repo](https://github.com/evoleinik/fn
 - Hold **Fn** and speak → transcription
 - Release to transcribe and paste
 - Click menu bar icon (○) to toggle **Press Return after paste** (sends Return key after pasting)
+- Click menu bar icon (○) to toggle **Paste while speaking** (each finished phrase pastes as you go)
 - Click menu bar icon (○) → **Edit Keywords…** to add custom vocabulary (opens in default text editor)
 - Click menu bar icon (○) → Quit to exit
 
@@ -97,7 +98,7 @@ Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.
 - **Non-blocking** - WebSocket connects in background, never freezes the app
 - **Auto-return mode** - Optional Return keypress after paste (toggle in menu bar)
 - **Ignores taps and shortcuts** - Presses under 0.3s and Fn used with another key (Fn+Delete, Fn+arrows) record nothing
-- **Live paste (optional)** - `echo 1 > ~/.config/fnkey/live_paste` pastes each finished phrase while Fn is still held. Off by default. Return (if on) is pressed once, at release. Once a phrase is pasted, the Groq fallback is skipped so nothing is pasted twice. Phrases already pasted stay if you then turn the press into a shortcut.
+- **Paste while speaking (optional)** - Turn it on in the menu bar (○ → **Paste while speaking**). Each finished phrase pastes while Fn is still held. Off by default, saved as `~/.config/fnkey/live_paste`. Return (if on) is pressed once, at release. Once a phrase is pasted, the Groq fallback is skipped so nothing is pasted twice. Phrases already pasted stay if you then turn the press into a shortcut.
 - **No invented text** - When Deepgram hears no speech, nothing is pasted. Groq runs only when Deepgram can't answer, because Whisper turns silence into phrases like "Thank you for watching!"
 - **Diagnostics** - Deepgram problems go to `~/.config/fnkey/error.log` with the server, connect time and bytes sent
 

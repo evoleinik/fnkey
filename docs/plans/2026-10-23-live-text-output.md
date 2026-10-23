@@ -84,6 +84,8 @@ with the fallback disabled once anything is pasted.
   of speech at 2.5 words a second. 72% under about 10 s, 14% at 10–30 s, under 5% at 30–60 s. The
   10% over 150 words are probably mostly pasted text. This supports C. Live text would show early in
   about 1 dictation in 5.
+- 2026-10-23, Eugene (after first use): "It's pasting. It's very, very good." Asked for a menu toggle like
+  "Press Return after paste". Also: "somehow it doesn't always work, or there is a delay."
 
 ## Questions for Eugene
 
@@ -95,7 +97,8 @@ with the fallback disabled once anything is pasted.
 
 ## Decision — 2026-10-23
 
-Build A behind `~/.config/fnkey/live_paste` (`1` turns it on), off by default. The recommendation stayed
+Build A as a menu toggle, "Paste while speaking", next to "Press Return after paste" (Eugene asked for
+the menu after first use). It is saved as `~/.config/fnkey/live_paste` and off by default. The recommendation stayed
 C on the measured lengths. Eugene chose A, and being off by default keeps the risk his alone. Guard rails:
 - Only final phrases paste. Drafts never do, so nothing has to be erased.
 - Pastes are spaced at least 200 ms apart, so a burst of finals cannot race the clipboard.

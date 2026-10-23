@@ -8,7 +8,7 @@
 //!   deepgram_host - Deepgram server (default api.deepgram.com, in the US).
 //!                   Regions: api.eu.deepgram.com, api.in.deepgram.com, api.au.deepgram.com
 //!   api_key       - Groq API key (batch fallback + polish)
-//!   live_paste    - "1" pastes each finished phrase while Fn is still held (default: paste at release)
+//!   live_paste    - "1" pastes each finished phrase while Fn is held. Menu: "Paste while speaking"
 
 use std::collections::HashMap;
 use std::env;
@@ -323,8 +323,6 @@ struct AppState {
     /// Whether a Deepgram stream is active
     ws_active: Arc<AtomicBool>,
     deepgram_host: String,
-    /// Paste each final phrase while Fn is held
-    live_paste: bool,
     /// When the trigger key went down, None while idle
     pressed_at: Mutex<Option<Instant>>,
     /// Set when another key is used during the press (fn+Delete, fn+arrow)
@@ -337,6 +335,9 @@ static mut STATUS_ITEM: *mut Object = std::ptr::null_mut();
 static mut AUDIO_STREAM: Option<Stream> = None;
 static AUTO_RETURN: AtomicBool = AtomicBool::new(false);
 static mut AUTO_RETURN_ITEM: *mut Object = std::ptr::null_mut();
+/// Paste each final phrase while Fn is held. Read on every press, so the menu toggle applies at once.
+static LIVE_PASTE: AtomicBool = AtomicBool::new(false);
+static mut LIVE_PASTE_ITEM: *mut Object = std::ptr::null_mut();
 
 fn read_config_file(name: &str) -> Option<String> {
     let home = env::var_os("HOME")?;
@@ -390,10 +391,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Load auto-return preference
-    if read_config_file("auto_return").map_or(false, |v| v == "1") {
-        AUTO_RETURN.store(true, Ordering::SeqCst);
-    }
+    // Load menu settings
+    AUTO_RETURN.store(read_config_file("auto_return").map_or(false, |v| v == "1"), Ordering::SeqCst);
+    LIVE_PASTE.store(read_config_file("live_paste").map_or(false, |v| v == "1"), Ordering::SeqCst);
 
     // Load custom keywords for transcription accuracy
     let keywords = read_config_file("keywords")
@@ -420,7 +420,6 @@ fn main() {
         dg_result_rx: Mutex::new(None),
         ws_active: Arc::new(AtomicBool::new(false)),
         deepgram_host,
-        live_paste: read_config_file("live_paste").map_or(false, |v| v == "1"),
         pressed_at: Mutex::new(None),
         combo: AtomicBool::new(false),
         dg_stats: Mutex::new(None),
@@ -825,7 +824,7 @@ fn start_recording(state: &Arc<AppState>) {
         let kw = state.keywords.clone();
         let stats = Arc::new(DgStats::new(state.deepgram_host.clone(), pressed));
         *state.dg_stats.lock().unwrap() = Some(Arc::clone(&stats));
-        spawn_deepgram_thread(key, rx, kw, result_tx, stats, state.live_paste);
+        spawn_deepgram_thread(key, rx, kw, result_tx, stats, LIVE_PASTE.load(Ordering::SeqCst));
 
         // Spawn audio forwarder: drains buffer, resamples, sends to WS thread
         let buffer = Arc::clone(&state.audio_buffer);
@@ -1039,23 +1038,30 @@ fn show_alert(title: &str, message: &str) {
     }
 }
 
-extern "C" fn toggle_auto_return(_this: &Object, _cmd: Sel, _sender: id) {
-    let new_val = !AUTO_RETURN.load(Ordering::SeqCst);
-    AUTO_RETURN.store(new_val, Ordering::SeqCst);
-    unsafe {
-        if !AUTO_RETURN_ITEM.is_null() {
-            let state: i64 = if new_val { 1 } else { 0 };
-            let _: () = msg_send![AUTO_RETURN_ITEM as id, setState: state];
-        }
+/// Flips a menu setting, ticks its menu item and saves it as ~/.config/fnkey/<file>
+unsafe fn toggle_setting(flag: &AtomicBool, item: *mut Object, file: &str) {
+    let new_val = !flag.load(Ordering::SeqCst);
+    flag.store(new_val, Ordering::SeqCst);
+    if !item.is_null() {
+        let state: i64 = if new_val { 1 } else { 0 };
+        let _: () = msg_send![item as id, setState: state];
     }
     if let Some(home) = env::var_os("HOME") {
-        let path = std::path::Path::new(&home).join(".config").join("fnkey").join("auto_return");
+        let path = std::path::Path::new(&home).join(".config").join("fnkey").join(file);
         if new_val {
             let _ = std::fs::write(&path, "1");
         } else {
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+extern "C" fn toggle_auto_return(_this: &Object, _cmd: Sel, _sender: id) {
+    unsafe { toggle_setting(&AUTO_RETURN, AUTO_RETURN_ITEM, "auto_return") }
+}
+
+extern "C" fn toggle_live_paste(_this: &Object, _cmd: Sel, _sender: id) {
+    unsafe { toggle_setting(&LIVE_PASTE, LIVE_PASTE_ITEM, "live_paste") }
 }
 
 extern "C" fn edit_keywords(_this: &Object, _cmd: Sel, _sender: id) {
@@ -1082,11 +1088,29 @@ fn register_menu_handler_class() {
             toggle_auto_return as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
+            sel!(toggleLivePaste:),
+            toggle_live_paste as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
             sel!(editKeywords:),
             edit_keywords as extern "C" fn(&Object, Sel, id),
         );
     }
     decl.register();
+}
+
+/// Adds a menu item with a checkmark that calls `action` on the handler
+unsafe fn add_toggle_item(menu: id, handler: id, title: &str, action: Sel, on: bool) -> *mut Object {
+    let title = NSString::alloc(nil).init_str(title);
+    let empty_key = NSString::alloc(nil).init_str("");
+    let item: id = msg_send![class!(NSMenuItem), alloc];
+    let item: id = msg_send![item, initWithTitle: title action: action keyEquivalent: empty_key];
+    let _: () = msg_send![item, setTarget: handler];
+    if on {
+        let _: () = msg_send![item, setState: 1_i64];
+    }
+    let _: () = msg_send![menu, addItem: item];
+    item as *mut Object
 }
 
 unsafe fn create_status_item() {
@@ -1101,20 +1125,17 @@ unsafe fn create_status_item() {
     let _: () = msg_send![button, setTitle: title];
     let menu: id = NSMenu::new(nil);
 
-    // Auto Return toggle
+    // Setting toggles
     let handler_class = Class::get("FnKeyMenuHandler").unwrap();
     let handler: id = msg_send![handler_class, new];
     let _: () = msg_send![handler, retain];
-    let auto_return_title = NSString::alloc(nil).init_str("Press Return after paste");
     let empty_key = NSString::alloc(nil).init_str("");
-    let auto_return_item: id = msg_send![class!(NSMenuItem), alloc];
-    let auto_return_item: id = msg_send![auto_return_item, initWithTitle: auto_return_title action: sel!(toggleAutoReturn:) keyEquivalent: empty_key];
-    let _: () = msg_send![auto_return_item, setTarget: handler];
-    if AUTO_RETURN.load(Ordering::SeqCst) {
-        let _: () = msg_send![auto_return_item, setState: 1_i64];
-    }
-    AUTO_RETURN_ITEM = auto_return_item as *mut Object;
-    let _: () = msg_send![menu, addItem: auto_return_item];
+    AUTO_RETURN_ITEM = add_toggle_item(
+        menu, handler, "Press Return after paste", sel!(toggleAutoReturn:), AUTO_RETURN.load(Ordering::SeqCst),
+    );
+    LIVE_PASTE_ITEM = add_toggle_item(
+        menu, handler, "Paste while speaking", sel!(toggleLivePaste:), LIVE_PASTE.load(Ordering::SeqCst),
+    );
 
     // Edit Keywords
     let keywords_title = NSString::alloc(nil).init_str("Edit Keywords…");
