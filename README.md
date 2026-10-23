@@ -66,6 +66,17 @@ The icon changes: ○ (idle) → ● (recording)
 
 If both keys are configured, Deepgram streaming is preferred.
 
+### Deepgram region
+
+Deepgram's default server is in the US. Far from it, each press waits longer and some results arrive too late.
+Point FnKey at the closest region. The same key works on every region.
+
+```bash
+echo 'api.in.deepgram.com' > ~/.config/fnkey/deepgram_host   # or api.eu / api.au
+```
+
+From Bangkok, connect plus result took about 0.5s on `api.in` against 1.2–7.7s on the US default.
+
 ## Build from source
 
 ```bash
@@ -85,6 +96,8 @@ Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.
 - **Auto sample rate** - Uses device's native sample rate, resamples to 16kHz for Deepgram
 - **Non-blocking** - WebSocket connects in background, never freezes the app
 - **Auto-return mode** - Optional Return keypress after paste (toggle in menu bar)
+- **Ignores taps and shortcuts** - Presses under 0.3s and Fn used with another key (Fn+Delete, Fn+arrows) record nothing
+- **Diagnostics** - Deepgram problems go to `~/.config/fnkey/error.log` with the server, connect time and bytes sent
 
 ## Custom Keywords
 

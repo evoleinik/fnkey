@@ -5,6 +5,8 @@
 //!
 //! Config files (~/.config/fnkey/):
 //!   deepgram_key  - Deepgram API key (streaming, preferred)
+//!   deepgram_host - Deepgram server (default api.deepgram.com, in the US).
+//!                   Regions: api.eu.deepgram.com, api.in.deepgram.com, api.au.deepgram.com
 //!   api_key       - Groq API key (batch fallback + polish)
 
 use std::collections::HashMap;
@@ -12,11 +14,11 @@ use std::env;
 use std::ffi::c_void;
 use std::io::Cursor;
 use std::io::Write as IoWrite;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyAccessory, NSMenu};
@@ -120,7 +122,14 @@ fn get_paste_keycode() -> u16 {
 
 const FN_KEY_FLAG: u64 = 0x800000;
 const OPTION_KEY_FLAG: u64 = 0x80000;
+/// Shift, Control, Option, Command and Fn. Caps Lock is left out because it stays on.
+const MODIFIER_FLAGS: u64 = 0x20000 | 0x40000 | 0x80000 | 0x100000 | 0x800000;
 const DEEPGRAM_SAMPLE_RATE: u32 = 16000;
+const DEFAULT_DEEPGRAM_HOST: &str = "api.deepgram.com";
+/// A press shorter than this is a tap, not dictation.
+const MIN_HOLD: Duration = Duration::from_millis(300);
+/// How long to wait for Deepgram's text after the key is released.
+const DEEPGRAM_WAIT: Duration = Duration::from_secs(10);
 
 /// Messages sent from audio callback / event tap to the WebSocket thread
 enum WsCommand {
@@ -128,6 +137,37 @@ enum WsCommand {
     Audio(Vec<u8>),
     /// Stop streaming, finalize, paste result
     Stop,
+    /// The press was a tap or a shortcut: close quietly and report nothing
+    Cancel,
+}
+
+/// Progress of one Deepgram stream, shared with the thread that waits for its text
+struct DgStats {
+    host: String,
+    pressed: Instant,
+    /// Milliseconds from key press to an open WebSocket, u64::MAX until then
+    connect_ms: AtomicU64,
+    chunks: AtomicU32,
+    bytes: AtomicUsize,
+    msgs: AtomicU32,
+}
+
+impl DgStats {
+    fn summary(&self) -> String {
+        let connect = match self.connect_ms.load(Ordering::SeqCst) {
+            u64::MAX => "not connected".to_string(),
+            ms => format!("connected in {}ms", ms),
+        };
+        format!(
+            "{} {}, {}ms since press, {} chunks/{}KB sent, {} msgs recv'd",
+            self.host,
+            connect,
+            self.pressed.elapsed().as_millis(),
+            self.chunks.load(Ordering::SeqCst),
+            self.bytes.load(Ordering::SeqCst) / 1024,
+            self.msgs.load(Ordering::SeqCst)
+        )
+    }
 }
 
 /// Result from Deepgram streaming thread
@@ -153,6 +193,13 @@ struct AppState {
     dg_result_rx: Mutex<Option<mpsc::Receiver<DgResult>>>,
     /// Whether a Deepgram stream is active
     ws_active: Arc<AtomicBool>,
+    deepgram_host: String,
+    /// When the trigger key went down, None while idle
+    pressed_at: Mutex<Option<Instant>>,
+    /// Set when another key is used during the press (fn+Delete, fn+arrow)
+    combo: AtomicBool,
+    /// Progress of the active Deepgram stream
+    dg_stats: Mutex<Option<Arc<DgStats>>>,
 }
 
 static mut STATUS_ITEM: *mut Object = std::ptr::null_mut();
@@ -228,6 +275,17 @@ fn main() {
         })
         .unwrap_or_default();
 
+    // Deepgram region: a bare hostname, though a pasted wss:// URL works too
+    let deepgram_host = read_config_file("deepgram_host")
+        .map(|h| {
+            h.trim_start_matches("wss://")
+                .trim_start_matches("https://")
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| DEFAULT_DEEPGRAM_HOST.to_string());
+
     let state = Arc::new(AppState {
         audio_buffer: Arc::new(Mutex::new(Vec::new())),
         shadow_buffer: Arc::new(Mutex::new(Vec::new())),
@@ -239,6 +297,10 @@ fn main() {
         ws_tx: Mutex::new(None),
         dg_result_rx: Mutex::new(None),
         ws_active: Arc::new(AtomicBool::new(false)),
+        deepgram_host,
+        pressed_at: Mutex::new(None),
+        combo: AtomicBool::new(false),
+        dg_stats: Mutex::new(None),
     });
 
     unsafe {
@@ -265,15 +327,16 @@ fn spawn_deepgram_thread(
     rx: mpsc::Receiver<WsCommand>,
     keywords: Vec<String>,
     result_tx: mpsc::Sender<DgResult>,
+    stats: Arc<DgStats>,
 ) {
     thread::spawn(move || {
         let mut url = format!(
-            "wss://api.deepgram.com/v1/listen?\
+            "wss://{}/v1/listen?\
              encoding=linear16&sample_rate={}&channels=1&\
              interim_results=true&endpointing=300&\
              punctuate=true&smart_format=true&model=nova-3&\
              language=multi",
-            DEEPGRAM_SAMPLE_RATE
+            stats.host, DEEPGRAM_SAMPLE_RATE
         );
         for kw in &keywords {
             url.push_str(&format!("&keyterm={}", urlencoding::encode(kw)));
@@ -281,7 +344,7 @@ fn spawn_deepgram_thread(
         let request = tungstenite::http::Request::builder()
             .uri(&url)
             .header("Authorization", format!("Token {}", key))
-            .header("Host", "api.deepgram.com")
+            .header("Host", stats.host.as_str())
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
@@ -300,6 +363,7 @@ fn spawn_deepgram_thread(
                 return;
             }
         };
+        stats.connect_ms.store(stats.pressed.elapsed().as_millis() as u64, Ordering::SeqCst);
 
         // Set WebSocket to non-blocking so we can interleave send/recv
         if let tungstenite::stream::MaybeTlsStream::NativeTls(ref s) = ws.get_ref() {
@@ -312,10 +376,6 @@ fn spawn_deepgram_thread(
         let mut raw_msgs: Vec<String> = Vec::new();
         let mut running = true;
         let mut ws_error: Option<String> = None;
-        let started = std::time::Instant::now();
-        let mut chunks_sent: u32 = 0;
-        let mut bytes_sent: usize = 0;
-        let mut msgs_received: u32 = 0;
         let mut got_stop = false;
 
         while running {
@@ -330,15 +390,18 @@ fn spawn_deepgram_thread(
                                 continue;
                             }
                         }
-                        let msg = format!("Deepgram send error after {}ms, {} chunks/{}KB sent: {}",
-                            started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024, e);
+                        let msg = format!("Deepgram send error: {}: {}", e, stats.summary());
                         log_error(&msg);
                         ws_error = Some(msg);
                         running = false;
                     } else {
-                        chunks_sent += 1;
-                        bytes_sent += len;
+                        stats.chunks.fetch_add(1, Ordering::SeqCst);
+                        stats.bytes.fetch_add(len, Ordering::SeqCst);
                     }
+                }
+                Ok(WsCommand::Cancel) => {
+                    let _ = ws.close(None);
+                    return;
                 }
                 Ok(WsCommand::Stop) => {
                     got_stop = true;
@@ -359,7 +422,7 @@ fn spawn_deepgram_thread(
                     loop {
                         match ws.read() {
                             Ok(Message::Text(text)) => {
-                                msgs_received += 1;
+                                stats.msgs.fetch_add(1, Ordering::SeqCst);
                                 accumulate_transcript(&text, &mut transcript, &mut raw_msgs);
                             }
                             Ok(Message::Close(frame)) => {
@@ -379,8 +442,7 @@ fn spawn_deepgram_thread(
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    ws_error = Some(format!("Deepgram: channel disconnected after {}ms, {} chunks/{}KB sent",
-                        started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024));
+                    ws_error = Some(format!("Deepgram: channel disconnected: {}", stats.summary()));
                     running = false;
                 }
             }
@@ -388,7 +450,7 @@ fn spawn_deepgram_thread(
             // 2. Try to read transcript from WebSocket (non-blocking)
             match ws.read() {
                 Ok(Message::Text(text)) => {
-                    msgs_received += 1;
+                    stats.msgs.fetch_add(1, Ordering::SeqCst);
                     accumulate_transcript(&text, &mut transcript, &mut raw_msgs);
                 }
                 Ok(Message::Close(frame)) => {
@@ -397,8 +459,7 @@ fn spawn_deepgram_thread(
                         let reason = frame.as_ref()
                             .map(|f| format!("code={}, reason='{}'", f.code, f.reason))
                             .unwrap_or_else(|| "no close frame".to_string());
-                        let msg = format!("Deepgram server closed early after {}ms, {} chunks/{}KB sent, {} msgs recv'd: {}",
-                            started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024, msgs_received, reason);
+                        let msg = format!("Deepgram server closed early: {}: {}", reason, stats.summary());
                         log_error(&msg);
                         ws_error = Some(msg);
                     }
@@ -408,16 +469,14 @@ fn spawn_deepgram_thread(
                     if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(tungstenite::Error::ConnectionClosed) => {
                     if !got_stop {
-                        let msg = format!("Deepgram connection dropped after {}ms, {} chunks/{}KB sent, {} msgs recv'd",
-                            started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024, msgs_received);
+                        let msg = format!("Deepgram connection dropped: {}", stats.summary());
                         log_error(&msg);
                         ws_error = Some(msg);
                     }
                     running = false;
                 }
                 Err(e) => {
-                    let msg = format!("Deepgram WebSocket error after {}ms, {} chunks/{}KB sent, {} msgs recv'd: {}",
-                        started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024, msgs_received, e);
+                    let msg = format!("Deepgram WebSocket error: {}: {}", e, stats.summary());
                     log_error(&msg);
                     ws_error = Some(msg);
                     running = false;
@@ -432,14 +491,17 @@ fn spawn_deepgram_thread(
         // Send result back — if we got a transcript, use it even if WS errored
         let text = transcript.trim().to_string();
         if !text.is_empty() {
-            let _ = result_tx.send(DgResult::Ok(text));
+            if result_tx.send(DgResult::Ok(text)).is_err() {
+                // The waiter already gave up, so Deepgram was slow rather than wrong
+                log_error(&format!(
+                    "Deepgram text arrived after the {}s wait and was dropped: {}",
+                    DEEPGRAM_WAIT.as_secs(), stats.summary()
+                ));
+            }
         } else if let Some(err) = ws_error {
             let _ = result_tx.send(DgResult::Err(err));
         } else {
-            let mut msg = format!(
-                "Deepgram: empty transcript after {}ms, {} chunks/{}KB sent, {} msgs recv'd",
-                started.elapsed().as_millis(), chunks_sent, bytes_sent / 1024, msgs_received
-            );
+            let mut msg = format!("Deepgram: empty transcript: {}", stats.summary());
             // Log raw Deepgram responses so we can see what it actually sent
             for (i, raw) in raw_msgs.iter().enumerate() {
                 msg.push_str(&format!("\n  msg[{}]: {}", i, raw));
@@ -573,6 +635,10 @@ fn init_audio_stream(state: &Arc<AppState>) {
 
 /// Called from event tap — must be non-blocking
 fn start_recording(state: &Arc<AppState>) {
+    let pressed = Instant::now();
+    *state.pressed_at.lock().unwrap() = Some(pressed);
+    state.combo.store(false, Ordering::SeqCst);
+
     // Clear buffers
     {
         let mut buffer = state.audio_buffer.lock().unwrap();
@@ -611,7 +677,16 @@ fn start_recording(state: &Arc<AppState>) {
 
         let key = dg_key.clone();
         let kw = state.keywords.clone();
-        spawn_deepgram_thread(key, rx, kw, result_tx);
+        let stats = Arc::new(DgStats {
+            host: state.deepgram_host.clone(),
+            pressed,
+            connect_ms: AtomicU64::new(u64::MAX),
+            chunks: AtomicU32::new(0),
+            bytes: AtomicUsize::new(0),
+            msgs: AtomicU32::new(0),
+        });
+        *state.dg_stats.lock().unwrap() = Some(Arc::clone(&stats));
+        spawn_deepgram_thread(key, rx, kw, result_tx, stats);
 
         // Spawn audio forwarder: drains buffer, resamples, sends to WS thread
         let buffer = Arc::clone(&state.audio_buffer);
@@ -664,6 +739,18 @@ fn stop_recording(state: &Arc<AppState>) {
 
     update_status_icon(false);
 
+    // A tap or a shortcut like fn+Delete is not dictation: drop it without a word
+    let held = state.pressed_at.lock().unwrap().take().map_or(Duration::ZERO, |t| t.elapsed());
+    if held < MIN_HOLD || state.combo.load(Ordering::SeqCst) {
+        state.ws_active.store(false, Ordering::SeqCst);
+        if let Some(tx) = state.ws_tx.lock().unwrap().take() {
+            let _ = tx.send(WsCommand::Cancel);
+        }
+        state.dg_result_rx.lock().unwrap().take();
+        state.dg_stats.lock().unwrap().take();
+        return;
+    }
+
     let was_streaming = state.ws_active.load(Ordering::SeqCst);
 
     // Grab shadow buffer for potential Groq fallback
@@ -706,9 +793,10 @@ fn stop_recording(state: &Arc<AppState>) {
 
         // Wait for Deepgram result in background, fallback to Groq if needed
         let result_rx = state.dg_result_rx.lock().unwrap().take();
+        let stats = state.dg_stats.lock().unwrap().take();
         thread::spawn(move || {
             let dg_text = if let Some(rx) = result_rx {
-                match rx.recv_timeout(Duration::from_secs(5)) {
+                match rx.recv_timeout(DEEPGRAM_WAIT) {
                     Ok(DgResult::Ok(text)) if !text.is_empty() => Some(text),
                     Ok(DgResult::Ok(_)) => {
                         log_error("Deepgram: empty transcript");
@@ -719,7 +807,11 @@ fn stop_recording(state: &Arc<AppState>) {
                         None
                     }
                     Err(_) => {
-                        log_error("Deepgram: timeout waiting for result");
+                        let detail = stats.as_ref().map_or(String::new(), |s| s.summary());
+                        log_error(&format!(
+                            "Deepgram: no result after waiting {}s: {}",
+                            DEEPGRAM_WAIT.as_secs(), detail
+                        ));
                         None
                     }
                 }
@@ -934,8 +1026,16 @@ fn run_event_tap(state: Arc<AppState>) {
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::ListenOnly,
-        vec![CGEventType::FlagsChanged],
-        move |_, _, event| {
+        vec![CGEventType::FlagsChanged, CGEventType::KeyDown],
+        move |_, event_type, event| {
+            // A key typed during the press makes it a shortcut (fn+Delete, fn+arrow)
+            if matches!(event_type, CGEventType::KeyDown) {
+                if was_pressed_clone.load(Ordering::SeqCst) {
+                    state_for_callback.combo.store(true, Ordering::SeqCst);
+                }
+                return None;
+            }
+
             let flags = event.get_flags().bits();
             let fn_pressed = (flags & FN_KEY_FLAG) != 0;
             let option_pressed = (flags & OPTION_KEY_FLAG) != 0;
@@ -952,6 +1052,12 @@ fn run_event_tap(state: Arc<AppState>) {
                 start_recording(&state_for_callback);
             } else if !key_pressed && prev_pressed {
                 stop_recording(&state_for_callback);
+            }
+
+            // Another modifier held with the trigger (fn+Shift, Option+Command) is a shortcut too
+            let trigger_flag = if use_fn { FN_KEY_FLAG } else { OPTION_KEY_FLAG };
+            if key_pressed && flags & MODIFIER_FLAGS & !trigger_flag != 0 {
+                state_for_callback.combo.store(true, Ordering::SeqCst);
             }
 
             was_pressed_clone.store(key_pressed, Ordering::SeqCst);
