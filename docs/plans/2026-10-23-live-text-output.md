@@ -2,7 +2,7 @@
 
 **Type:** Decision doc
 **Date:** 2026-10-23
-**Status:** Open. Waiting on the questions at the end.
+**Status:** Decided 2026-10-23. Build A, off by default.
 
 ## Question
 
@@ -79,9 +79,26 @@ with the fallback disabled once anything is pasted.
 - 2026-10-23, Claude (risk): the same day, Groq turned silence into "Thank you for watching!" and
   auto-return sent it into a chat. Text that lands early cannot be taken back.
 - 2026-10-23, Eugene (effort): "I guess it's not a big change." Agreed on size, about 60–100 lines.
+- 2026-10-23, Claude (measurement): Deepgram's usage API refuses this key (403), so length was estimated
+  from 2,182 messages Eugene sent to Claude in 30 days, mostly by FnKey. Median 10 words, about 4 s
+  of speech at 2.5 words a second. 72% under about 10 s, 14% at 10–30 s, under 5% at 30–60 s. The
+  10% over 150 words are probably mostly pasted text. This supports C. Live text would show early in
+  about 1 dictation in 5.
 
 ## Questions for Eugene
 
 1. Criterion 2: how long are most of your dictations? Under 10 s, 10–30 s, or often over 30 s?
+   **Answer:** "You can measure it." Measured above: median about 4 s, 72% under about 10 s.
 2. Criteria 1 and 2: which should FnKey do: keep paste at release, paste phrases live, or show a
    menu bar preview?
+   **Answer:** Paste phrases live.
+
+## Decision — 2026-10-23
+
+Build A behind `~/.config/fnkey/live_paste` (`1` turns it on), off by default. The recommendation stayed
+C on the measured lengths. Eugene chose A, and being off by default keeps the risk his alone. Guard rails:
+- Only final phrases paste. Drafts never do, so nothing has to be erased.
+- Pastes are spaced at least 200 ms apart, so a burst of finals cannot race the clipboard.
+- Once anything has pasted, no Groq fallback runs, so text is never doubled.
+- "Press Return after paste" fires once, at release, after the last phrase.
+- FnKey tags its own key events so its key listener never treats them as a shortcut.

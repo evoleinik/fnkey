@@ -8,13 +8,14 @@
 //!   deepgram_host - Deepgram server (default api.deepgram.com, in the US).
 //!                   Regions: api.eu.deepgram.com, api.in.deepgram.com, api.au.deepgram.com
 //!   api_key       - Groq API key (batch fallback + polish)
+//!   live_paste    - "1" pastes each finished phrase while Fn is still held (default: paste at release)
 
 use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
 use std::io::Cursor;
 use std::io::Write as IoWrite;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -27,7 +28,7 @@ use cocoa::foundation::{NSAutoreleasePool, NSString};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-    CGEventType,
+    CGEventType, EventField,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -130,6 +131,15 @@ const DEFAULT_DEEPGRAM_HOST: &str = "api.deepgram.com";
 const MIN_HOLD: Duration = Duration::from_millis(300);
 /// How long to wait for Deepgram's text after the key is released.
 const DEEPGRAM_WAIT: Duration = Duration::from_secs(10);
+/// Least time between live pastes, so the app reads the clipboard before it changes again.
+const PASTE_GAP: Duration = Duration::from_millis(200);
+/// Marks key events FnKey posts itself, so its own listener ignores them.
+const OWN_EVENT_TAG: i64 = 0x464E_4B59;
+
+/// Who puts text into the app for one press. Set once, so text is never pasted twice.
+const OWNER_NONE: u8 = 0;
+const OWNER_LIVE: u8 = 1;
+const OWNER_GROQ: u8 = 2;
 
 /// Messages sent from audio callback / event tap to the WebSocket thread
 enum WsCommand {
@@ -150,6 +160,79 @@ struct DgStats {
     chunks: AtomicU32,
     bytes: AtomicUsize,
     msgs: AtomicU32,
+    /// OWNER_NONE until live paste or the Groq fallback claims the output
+    owner: AtomicU8,
+}
+
+impl DgStats {
+    fn new(host: String, pressed: Instant) -> Self {
+        DgStats {
+            host,
+            pressed,
+            connect_ms: AtomicU64::new(u64::MAX),
+            chunks: AtomicU32::new(0),
+            bytes: AtomicUsize::new(0),
+            msgs: AtomicU32::new(0),
+            owner: AtomicU8::new(OWNER_NONE),
+        }
+    }
+
+    /// True if live paste may paste: it already owns the output or just claimed it
+    fn claim_live(&self) -> bool {
+        match self.owner.compare_exchange(OWNER_NONE, OWNER_LIVE, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => true,
+            Err(current) => current == OWNER_LIVE,
+        }
+    }
+
+    /// True if Groq may paste: nothing has been pasted live
+    fn claim_groq(&self) -> bool {
+        self.owner
+            .compare_exchange(OWNER_NONE, OWNER_GROQ, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn live_pasted(&self) -> bool {
+        self.owner.load(Ordering::SeqCst) == OWNER_LIVE
+    }
+}
+
+/// Final phrases waiting to be pasted while Fn is held
+#[derive(Default)]
+struct LivePaste {
+    pending: String,
+    pasted_any: bool,
+    last: Option<Instant>,
+}
+
+impl LivePaste {
+    fn add(&mut self, phrase: &str) {
+        if self.pasted_any || !self.pending.is_empty() {
+            self.pending.push(' ');
+        }
+        self.pending.push_str(phrase);
+    }
+
+    /// The waiting text, if any, once PASTE_GAP has passed since the last paste
+    fn take_due(&mut self, now: Instant) -> Option<String> {
+        if self.pending.is_empty() || self.last.map_or(false, |t| now.duration_since(t) < PASTE_GAP) {
+            return None;
+        }
+        self.last = Some(now);
+        self.pasted_any = true;
+        Some(std::mem::take(&mut self.pending))
+    }
+
+    /// Everything still waiting, after sleeping out the gap
+    fn take_rest(&mut self) -> Option<String> {
+        if let Some(t) = self.last {
+            let since = t.elapsed();
+            if since < PASTE_GAP {
+                thread::sleep(PASTE_GAP - since);
+            }
+        }
+        self.take_due(Instant::now())
+    }
 }
 
 /// Deepgram region from the config file: a bare hostname, though a pasted wss:// URL works too
@@ -203,17 +286,23 @@ enum DgResult {
 /// What to do once Deepgram has answered, or failed to
 enum Next {
     Paste(String),
+    /// The text was already pasted live: only the optional Return is left
+    ReturnOnly,
     /// Deepgram heard no speech. Whisper on the same audio invents stock
     /// phrases like "Thank you for watching!", so nothing is pasted.
+    /// Also used when live paste already put part of the text in the app.
     Nothing,
     Groq,
 }
 
 /// Groq is only for when Deepgram could not answer (no answer means a timeout)
-fn after_deepgram(answer: Option<DgResult>) -> Next {
+/// and nothing was pasted live, which Groq would paste a second time.
+fn after_deepgram(answer: Option<DgResult>, live_pasted: bool) -> Next {
     match answer {
         Some(DgResult::Ok(text)) if text.is_empty() => Next::Nothing,
+        Some(DgResult::Ok(_)) if live_pasted => Next::ReturnOnly,
         Some(DgResult::Ok(text)) => Next::Paste(text),
+        Some(DgResult::Err(_)) | None if live_pasted => Next::Nothing,
         Some(DgResult::Err(_)) | None => Next::Groq,
     }
 }
@@ -234,6 +323,8 @@ struct AppState {
     /// Whether a Deepgram stream is active
     ws_active: Arc<AtomicBool>,
     deepgram_host: String,
+    /// Paste each final phrase while Fn is held
+    live_paste: bool,
     /// When the trigger key went down, None while idle
     pressed_at: Mutex<Option<Instant>>,
     /// Set when another key is used during the press (fn+Delete, fn+arrow)
@@ -329,6 +420,7 @@ fn main() {
         dg_result_rx: Mutex::new(None),
         ws_active: Arc::new(AtomicBool::new(false)),
         deepgram_host,
+        live_paste: read_config_file("live_paste").map_or(false, |v| v == "1"),
         pressed_at: Mutex::new(None),
         combo: AtomicBool::new(false),
         dg_stats: Mutex::new(None),
@@ -359,8 +451,10 @@ fn spawn_deepgram_thread(
     keywords: Vec<String>,
     result_tx: mpsc::Sender<DgResult>,
     stats: Arc<DgStats>,
+    live: bool,
 ) {
     thread::spawn(move || {
+        let mut live = if live { Some(LivePaste::default()) } else { None };
         let mut url = format!(
             "wss://{}/v1/listen?\
              encoding=linear16&sample_rate={}&channels=1&\
@@ -453,7 +547,10 @@ fn spawn_deepgram_thread(
                         match ws.read() {
                             Ok(Message::Text(text)) => {
                                 stats.msgs.fetch_add(1, Ordering::SeqCst);
-                                accumulate_transcript(&text, &mut transcript);
+                                let phrase = accumulate_transcript(&text, &mut transcript);
+                                if let (Some(lp), Some(p)) = (live.as_mut(), phrase) {
+                                    lp.add(&p);
+                                }
                             }
                             Ok(Message::Close(frame)) => {
                                 if let Some(ref f) = frame {
@@ -481,7 +578,10 @@ fn spawn_deepgram_thread(
             match ws.read() {
                 Ok(Message::Text(text)) => {
                     stats.msgs.fetch_add(1, Ordering::SeqCst);
-                    accumulate_transcript(&text, &mut transcript);
+                    let phrase = accumulate_transcript(&text, &mut transcript);
+                    if let (Some(lp), Some(p)) = (live.as_mut(), phrase) {
+                        lp.add(&p);
+                    }
                 }
                 Ok(Message::Close(frame)) => {
                     if !got_stop {
@@ -514,8 +614,26 @@ fn spawn_deepgram_thread(
                 _ => {}
             }
 
+            // Live paste: put finished phrases in the app while Fn is still held
+            if let Some(lp) = live.as_mut() {
+                if let Some(text) = lp.take_due(Instant::now()) {
+                    if stats.claim_live() {
+                        paste_text(&text);
+                    }
+                }
+            }
+
             // Small sleep to avoid busy-spinning
             thread::sleep(Duration::from_millis(5));
+        }
+
+        // Live paste: the phrases that arrived after release go in before the result is sent
+        if let Some(lp) = live.as_mut() {
+            if let Some(text) = lp.take_rest() {
+                if stats.claim_live() {
+                    paste_text(&text);
+                }
+            }
         }
 
         // Send result back — if we got a transcript, use it even if WS errored
@@ -523,9 +641,10 @@ fn spawn_deepgram_thread(
         if !text.is_empty() {
             if result_tx.send(DgResult::Ok(text)).is_err() {
                 // The waiter already gave up, so Deepgram was slow rather than wrong
+                let fate = if stats.live_pasted() { "was pasted live" } else { "was dropped" };
                 log_error(&format!(
-                    "Deepgram text arrived after the {}s wait and was dropped: {}",
-                    DEEPGRAM_WAIT.as_secs(), stats.summary()
+                    "Deepgram text arrived after the {}s wait and {}: {}",
+                    DEEPGRAM_WAIT.as_secs(), fate, stats.summary()
                 ));
             }
         } else if let Some(err) = ws_error {
@@ -537,7 +656,8 @@ fn spawn_deepgram_thread(
     });
 }
 
-fn accumulate_transcript(json_text: &str, transcript: &mut String) {
+/// Adds a final phrase to the transcript and returns it. Drafts return None.
+fn accumulate_transcript(json_text: &str, transcript: &mut String) -> Option<String> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_text) {
         let is_final = v.get("is_final").and_then(|f| f.as_bool()).unwrap_or(false);
         let text = v.get("channel")
@@ -551,8 +671,10 @@ fn accumulate_transcript(json_text: &str, transcript: &mut String) {
                 transcript.push(' ');
             }
             transcript.push_str(text);
+            return Some(text.to_string());
         }
     }
+    None
 }
 
 /// Simple linear resampling
@@ -701,16 +823,9 @@ fn start_recording(state: &Arc<AppState>) {
 
         let key = dg_key.clone();
         let kw = state.keywords.clone();
-        let stats = Arc::new(DgStats {
-            host: state.deepgram_host.clone(),
-            pressed,
-            connect_ms: AtomicU64::new(u64::MAX),
-            chunks: AtomicU32::new(0),
-            bytes: AtomicUsize::new(0),
-            msgs: AtomicU32::new(0),
-        });
+        let stats = Arc::new(DgStats::new(state.deepgram_host.clone(), pressed));
         *state.dg_stats.lock().unwrap() = Some(Arc::clone(&stats));
-        spawn_deepgram_thread(key, rx, kw, result_tx, stats);
+        spawn_deepgram_thread(key, rx, kw, result_tx, stats, state.live_paste);
 
         // Spawn audio forwarder: drains buffer, resamples, sends to WS thread
         let buffer = Arc::clone(&state.audio_buffer);
@@ -835,25 +950,27 @@ fn stop_recording(state: &Arc<AppState>) {
                 log_error(&format!("Deepgram failed: {}", e));
             }
 
-            match after_deepgram(answer) {
+            let live_pasted = stats.as_ref().map_or(false, |s| s.live_pasted());
+            match after_deepgram(answer, live_pasted) {
                 Next::Paste(text) => {
-                    if let Ok(mut clipboard) = Clipboard::new() {
-                        if clipboard.set_text(&text).is_ok() {
-                            paste_and_maybe_return();
-                        }
+                    if paste_text(&text) {
+                        maybe_return();
                     }
                 }
+                Next::ReturnOnly => maybe_return(),
                 Next::Nothing => {}
                 Next::Groq => {
+                    // A live paste can land between the check above and here. The claim settles it.
+                    if !stats.as_ref().map_or(true, |s| s.claim_groq()) {
+                        return;
+                    }
                     if let Some(ref key) = groq_key {
                         if !shadow_audio.is_empty() {
                             show_notification("Deepgram failed, using Groq fallback");
                             log_error("Falling back to Groq Whisper");
                             if let Some(text) = transcribe_groq(shadow_audio, sample_rate, key, &keywords) {
-                                if let Ok(mut clipboard) = Clipboard::new() {
-                                    if clipboard.set_text(&text).is_ok() {
-                                        paste_and_maybe_return();
-                                    }
+                                if paste_text(&text) {
+                                    maybe_return();
                                 }
                             } else {
                                 show_notification("Transcription failed (both backends)");
@@ -875,10 +992,8 @@ fn stop_recording(state: &Arc<AppState>) {
         thread::spawn(move || {
             if let Some(ref key) = groq_key {
                 if let Some(text) = transcribe_groq(shadow_audio, sample_rate, key, &keywords) {
-                    if let Ok(mut clipboard) = Clipboard::new() {
-                        if clipboard.set_text(&text).is_ok() {
-                            paste_and_maybe_return();
-                        }
+                    if paste_text(&text) {
+                        maybe_return();
                     }
                 }
             }
@@ -1048,9 +1163,11 @@ fn run_event_tap(state: Arc<AppState>) {
         CGEventTapOptions::ListenOnly,
         vec![CGEventType::FlagsChanged, CGEventType::KeyDown],
         move |_, event_type, event| {
-            // A key typed during the press makes it a shortcut (fn+Delete, fn+arrow)
+            // A key typed during the press makes it a shortcut (fn+Delete, fn+arrow).
+            // FnKey's own live-paste Cmd+V is tagged and does not count.
             if matches!(event_type, CGEventType::KeyDown) {
-                if was_pressed_clone.load(Ordering::SeqCst) {
+                let own = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == OWN_EVENT_TAG;
+                if !own && was_pressed_clone.load(Ordering::SeqCst) {
                     state_for_callback.combo.store(true, Ordering::SeqCst);
                 }
                 return None;
@@ -1113,6 +1230,8 @@ fn paste_with_cgevent() {
             if let Ok(key_up) = CGEvent::new_keyboard_event(source, v_keycode, false) {
                 key_down.set_flags(CGEventFlags::CGEventFlagCommand);
                 key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+                key_down.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, OWN_EVENT_TAG);
+                key_up.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, OWN_EVENT_TAG);
                 key_down.post(CGEventTapLocation::HID);
                 key_up.post(CGEventTapLocation::HID);
             }
@@ -1127,8 +1246,19 @@ fn press_return() {
         .output();
 }
 
-fn paste_and_maybe_return() {
-    paste_with_cgevent();
+/// Puts text on the clipboard and sends Cmd+V. False if the clipboard refused it.
+fn paste_text(text: &str) -> bool {
+    match Clipboard::new() {
+        Ok(mut clipboard) if clipboard.set_text(text).is_ok() => {
+            paste_with_cgevent();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Presses Return when "Press Return after paste" is on
+fn maybe_return() {
     if AUTO_RETURN.load(Ordering::SeqCst) {
         // Let the paste finish processing before sending Return
         thread::sleep(Duration::from_millis(50));
@@ -1222,9 +1352,42 @@ mod tests {
 
     #[test]
     fn no_speech_never_reaches_groq() {
-        assert!(matches!(after_deepgram(Some(DgResult::Ok(String::new()))), Next::Nothing));
-        assert!(matches!(after_deepgram(Some(DgResult::Ok("hi".into()))), Next::Paste(t) if t == "hi"));
-        assert!(matches!(after_deepgram(Some(DgResult::Err("dropped".into()))), Next::Groq));
-        assert!(matches!(after_deepgram(None), Next::Groq));
+        assert!(matches!(after_deepgram(Some(DgResult::Ok(String::new())), false), Next::Nothing));
+        assert!(matches!(after_deepgram(Some(DgResult::Ok("hi".into())), false), Next::Paste(t) if t == "hi"));
+        assert!(matches!(after_deepgram(Some(DgResult::Err("dropped".into())), false), Next::Groq));
+        assert!(matches!(after_deepgram(None, false), Next::Groq));
+    }
+
+    #[test]
+    fn live_text_is_never_pasted_twice() {
+        assert!(matches!(after_deepgram(Some(DgResult::Ok("hi".into())), true), Next::ReturnOnly));
+        assert!(matches!(after_deepgram(Some(DgResult::Err("dropped".into())), true), Next::Nothing));
+        assert!(matches!(after_deepgram(None, true), Next::Nothing));
+        assert!(matches!(after_deepgram(Some(DgResult::Ok(String::new())), true), Next::Nothing));
+    }
+
+    #[test]
+    fn live_paste_and_groq_cannot_both_own_a_press() {
+        let s = DgStats::new("h".into(), Instant::now());
+        assert!(s.claim_live());
+        assert!(s.claim_live());
+        assert!(!s.claim_groq());
+        let s = DgStats::new("h".into(), Instant::now());
+        assert!(s.claim_groq());
+        assert!(!s.claim_live());
+        assert!(!s.live_pasted());
+    }
+
+    #[test]
+    fn live_phrases_are_spaced_and_joined() {
+        let t0 = Instant::now();
+        let mut lp = LivePaste::default();
+        assert_eq!(lp.take_due(t0), None);
+        lp.add("Hello.");
+        assert_eq!(lp.take_due(t0).as_deref(), Some("Hello."));
+        lp.add("How are you?");
+        assert_eq!(lp.take_due(t0 + Duration::from_millis(100)), None);
+        lp.add("Fine.");
+        assert_eq!(lp.take_due(t0 + PASTE_GAP).as_deref(), Some(" How are you? Fine."));
     }
 }
