@@ -1248,13 +1248,12 @@ fn press_return() {
 
 /// Puts text on the clipboard and sends Cmd+V. False if the clipboard refused it.
 fn paste_text(text: &str) -> bool {
-    match Clipboard::new() {
-        Ok(mut clipboard) if clipboard.set_text(text).is_ok() => {
-            paste_with_cgevent();
-            true
-        }
-        _ => false,
+    let Ok(mut clipboard) = Clipboard::new() else { return false };
+    if clipboard.set_text(text).is_err() {
+        return false;
     }
+    paste_with_cgevent();
+    true
 }
 
 /// Presses Return when "Press Return after paste" is on
