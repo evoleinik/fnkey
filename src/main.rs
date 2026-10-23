@@ -152,6 +152,28 @@ struct DgStats {
     msgs: AtomicU32,
 }
 
+/// Deepgram region from the config file: a bare hostname, though a pasted wss:// URL works too
+fn parse_deepgram_host(raw: Option<String>) -> String {
+    raw.map(|h| {
+        h.trim_start_matches("wss://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/')
+            .to_string()
+    })
+    .filter(|h| !h.is_empty())
+    .unwrap_or_else(|| DEFAULT_DEEPGRAM_HOST.to_string())
+}
+
+/// A press is dictation only when it is long enough and no other key was used
+fn is_dictation(held: Duration, combo: bool) -> bool {
+    held >= MIN_HOLD && !combo
+}
+
+/// True when a modifier other than the trigger is down (fn+Shift, Option+Command)
+fn other_modifier_held(flags: u64, trigger_flag: u64) -> bool {
+    flags & MODIFIER_FLAGS & !trigger_flag != 0
+}
+
 impl DgStats {
     fn summary(&self) -> String {
         let connect = match self.connect_ms.load(Ordering::SeqCst) {
@@ -275,16 +297,7 @@ fn main() {
         })
         .unwrap_or_default();
 
-    // Deepgram region: a bare hostname, though a pasted wss:// URL works too
-    let deepgram_host = read_config_file("deepgram_host")
-        .map(|h| {
-            h.trim_start_matches("wss://")
-                .trim_start_matches("https://")
-                .trim_end_matches('/')
-                .to_string()
-        })
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| DEFAULT_DEEPGRAM_HOST.to_string());
+    let deepgram_host = parse_deepgram_host(read_config_file("deepgram_host"));
 
     let state = Arc::new(AppState {
         audio_buffer: Arc::new(Mutex::new(Vec::new())),
@@ -741,7 +754,7 @@ fn stop_recording(state: &Arc<AppState>) {
 
     // A tap or a shortcut like fn+Delete is not dictation: drop it without a word
     let held = state.pressed_at.lock().unwrap().take().map_or(Duration::ZERO, |t| t.elapsed());
-    if held < MIN_HOLD || state.combo.load(Ordering::SeqCst) {
+    if !is_dictation(held, state.combo.load(Ordering::SeqCst)) {
         state.ws_active.store(false, Ordering::SeqCst);
         if let Some(tx) = state.ws_tx.lock().unwrap().take() {
             let _ = tx.send(WsCommand::Cancel);
@@ -1056,7 +1069,7 @@ fn run_event_tap(state: Arc<AppState>) {
 
             // Another modifier held with the trigger (fn+Shift, Option+Command) is a shortcut too
             let trigger_flag = if use_fn { FN_KEY_FLAG } else { OPTION_KEY_FLAG };
-            if key_pressed && flags & MODIFIER_FLAGS & !trigger_flag != 0 {
+            if key_pressed && other_modifier_held(flags, trigger_flag) {
                 state_for_callback.combo.store(true, Ordering::SeqCst);
             }
 
@@ -1166,4 +1179,37 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, hound::Error
         writer.finalize()?;
     }
     Ok(cursor.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_defaults_to_us_and_accepts_pasted_urls() {
+        assert_eq!(parse_deepgram_host(None), "api.deepgram.com");
+        assert_eq!(parse_deepgram_host(Some("api.in.deepgram.com".into())), "api.in.deepgram.com");
+        assert_eq!(parse_deepgram_host(Some("wss://api.in.deepgram.com/".into())), "api.in.deepgram.com");
+        assert_eq!(parse_deepgram_host(Some("https://api.eu.deepgram.com".into())), "api.eu.deepgram.com");
+        assert_eq!(parse_deepgram_host(Some("wss://".into())), "api.deepgram.com");
+    }
+
+    #[test]
+    fn taps_and_shortcuts_are_not_dictation() {
+        assert!(!is_dictation(Duration::from_millis(150), false));
+        assert!(!is_dictation(Duration::from_millis(299), false));
+        assert!(is_dictation(Duration::from_millis(300), false));
+        assert!(is_dictation(Duration::from_secs(5), false));
+        assert!(!is_dictation(Duration::from_secs(5), true));
+    }
+
+    #[test]
+    fn other_modifiers_make_a_shortcut() {
+        let (shift, cmd, caps) = (0x20000, 0x100000, 0x10000);
+        assert!(!other_modifier_held(FN_KEY_FLAG, FN_KEY_FLAG));
+        assert!(other_modifier_held(FN_KEY_FLAG | shift, FN_KEY_FLAG));
+        assert!(!other_modifier_held(FN_KEY_FLAG | caps, FN_KEY_FLAG));
+        assert!(!other_modifier_held(OPTION_KEY_FLAG, OPTION_KEY_FLAG));
+        assert!(other_modifier_held(OPTION_KEY_FLAG | cmd, OPTION_KEY_FLAG));
+    }
 }
