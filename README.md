@@ -52,6 +52,7 @@ If you find FnKey useful, please [star the repo](https://github.com/evoleinik/fn
 - Hold **Fn** and speak → transcription
 - Release to transcribe and paste
 - Click menu bar icon (○) to toggle **Press Return after paste** (sends Return key after pasting)
+- Click menu bar icon (○) to toggle **Paste while speaking** (each finished phrase pastes as you go)
 - Click menu bar icon (○) → **Edit Keywords…** to add custom vocabulary (opens in default text editor)
 - Click menu bar icon (○) → Quit to exit
 
@@ -65,6 +66,17 @@ The icon changes: ○ (idle) → ● (recording)
 | **Groq Whisper** | Batch | `api_key` | Full clip sent after release. Fallback if no Deepgram key. |
 
 If both keys are configured, Deepgram streaming is preferred.
+
+### Deepgram region
+
+Deepgram's default server is in the US. Far from it, each press waits longer and some results arrive too late.
+Point FnKey at the closest region. The same key works on every region.
+
+```bash
+echo 'api.in.deepgram.com' > ~/.config/fnkey/deepgram_host   # or api.eu / api.au
+```
+
+From Bangkok, connect plus result took about 0.5s on `api.in` against 1.2–7.7s on the US default.
 
 ## Build from source
 
@@ -85,6 +97,10 @@ Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.
 - **Auto sample rate** - Uses device's native sample rate, resamples to 16kHz for Deepgram
 - **Non-blocking** - WebSocket connects in background, never freezes the app
 - **Auto-return mode** - Optional Return keypress after paste (toggle in menu bar)
+- **Ignores taps and shortcuts** - Presses under 0.3s and Fn used with another key (Fn+Delete, Fn+arrows) record nothing
+- **Paste while speaking (optional)** - Turn it on in the menu bar (○ → **Paste while speaking**). Each finished phrase pastes while Fn is still held. Off by default, saved as `~/.config/fnkey/live_paste`. Return (if on) is pressed once, at release. Once a phrase is pasted, the Groq fallback is skipped so nothing is pasted twice. Phrases already pasted stay if you then turn the press into a shortcut.
+- **No invented text** - When Deepgram hears no speech, nothing is pasted. Groq runs only when Deepgram can't answer, because Whisper turns silence into phrases like "Thank you for watching!"
+- **Diagnostics** - Deepgram problems go to `~/.config/fnkey/error.log` with the server, connect time and bytes sent
 
 ## Custom Keywords
 
