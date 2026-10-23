@@ -97,6 +97,7 @@ Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.
 - **Non-blocking** - WebSocket connects in background, never freezes the app
 - **Auto-return mode** - Optional Return keypress after paste (toggle in menu bar)
 - **Ignores taps and shortcuts** - Presses under 0.3s and Fn used with another key (Fn+Delete, Fn+arrows) record nothing
+- **No invented text** - When Deepgram hears no speech, nothing is pasted. Groq runs only when Deepgram can't answer, because Whisper turns silence into phrases like "Thank you for watching!"
 - **Diagnostics** - Deepgram problems go to `~/.config/fnkey/error.log` with the server, connect time and bytes sent
 
 ## Custom Keywords

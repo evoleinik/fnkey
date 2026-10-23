@@ -194,10 +194,28 @@ impl DgStats {
 
 /// Result from Deepgram streaming thread
 enum DgResult {
-    /// Transcription succeeded (may be empty string)
+    /// Deepgram answered. Empty means it heard no speech.
     Ok(String),
     /// Connection or streaming error
     Err(String),
+}
+
+/// What to do once Deepgram has answered, or failed to
+enum Next {
+    Paste(String),
+    /// Deepgram heard no speech. Whisper on the same audio invents stock
+    /// phrases like "Thank you for watching!", so nothing is pasted.
+    Nothing,
+    Groq,
+}
+
+/// Groq is only for when Deepgram could not answer (no answer means a timeout)
+fn after_deepgram(answer: Option<DgResult>) -> Next {
+    match answer {
+        Some(DgResult::Ok(text)) if text.is_empty() => Next::Nothing,
+        Some(DgResult::Ok(text)) => Next::Paste(text),
+        Some(DgResult::Err(_)) | None => Next::Groq,
+    }
 }
 
 struct AppState {
@@ -386,7 +404,6 @@ fn spawn_deepgram_thread(
         }
 
         let mut transcript = String::new();
-        let mut raw_msgs: Vec<String> = Vec::new();
         let mut running = true;
         let mut ws_error: Option<String> = None;
         let mut got_stop = false;
@@ -436,7 +453,7 @@ fn spawn_deepgram_thread(
                         match ws.read() {
                             Ok(Message::Text(text)) => {
                                 stats.msgs.fetch_add(1, Ordering::SeqCst);
-                                accumulate_transcript(&text, &mut transcript, &mut raw_msgs);
+                                accumulate_transcript(&text, &mut transcript);
                             }
                             Ok(Message::Close(frame)) => {
                                 if let Some(ref f) = frame {
@@ -464,7 +481,7 @@ fn spawn_deepgram_thread(
             match ws.read() {
                 Ok(Message::Text(text)) => {
                     stats.msgs.fetch_add(1, Ordering::SeqCst);
-                    accumulate_transcript(&text, &mut transcript, &mut raw_msgs);
+                    accumulate_transcript(&text, &mut transcript);
                 }
                 Ok(Message::Close(frame)) => {
                     if !got_stop {
@@ -514,19 +531,13 @@ fn spawn_deepgram_thread(
         } else if let Some(err) = ws_error {
             let _ = result_tx.send(DgResult::Err(err));
         } else {
-            let mut msg = format!("Deepgram: empty transcript: {}", stats.summary());
-            // Log raw Deepgram responses so we can see what it actually sent
-            for (i, raw) in raw_msgs.iter().enumerate() {
-                msg.push_str(&format!("\n  msg[{}]: {}", i, raw));
-            }
-            log_error(&msg);
-            let _ = result_tx.send(DgResult::Err(msg.lines().next().unwrap_or(&msg).to_string()));
+            log_error(&format!("Deepgram heard no speech: {}", stats.summary()));
+            let _ = result_tx.send(DgResult::Ok(String::new()));
         }
     });
 }
 
-fn accumulate_transcript(json_text: &str, transcript: &mut String, raw_msgs: &mut Vec<String>) {
-    raw_msgs.push(json_text.to_string());
+fn accumulate_transcript(json_text: &str, transcript: &mut String) {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_text) {
         let is_final = v.get("is_final").and_then(|f| f.as_bool()).unwrap_or(false);
         let text = v.get("channel")
@@ -808,56 +819,52 @@ fn stop_recording(state: &Arc<AppState>) {
         let result_rx = state.dg_result_rx.lock().unwrap().take();
         let stats = state.dg_stats.lock().unwrap().take();
         thread::spawn(move || {
-            let dg_text = if let Some(rx) = result_rx {
-                match rx.recv_timeout(DEEPGRAM_WAIT) {
-                    Ok(DgResult::Ok(text)) if !text.is_empty() => Some(text),
-                    Ok(DgResult::Ok(_)) => {
-                        log_error("Deepgram: empty transcript");
-                        None
-                    }
-                    Ok(DgResult::Err(e)) => {
-                        log_error(&format!("Deepgram failed: {}", e));
-                        None
-                    }
-                    Err(_) => {
-                        let detail = stats.as_ref().map_or(String::new(), |s| s.summary());
-                        log_error(&format!(
-                            "Deepgram: no result after waiting {}s: {}",
-                            DEEPGRAM_WAIT.as_secs(), detail
-                        ));
-                        None
-                    }
+            let answer = match result_rx.map(|rx| rx.recv_timeout(DEEPGRAM_WAIT)) {
+                Some(Ok(answer)) => Some(answer),
+                Some(Err(_)) => {
+                    let detail = stats.as_ref().map_or(String::new(), |s| s.summary());
+                    log_error(&format!(
+                        "Deepgram: no result after waiting {}s: {}",
+                        DEEPGRAM_WAIT.as_secs(), detail
+                    ));
+                    None
                 }
-            } else {
-                None
+                None => None,
             };
+            if let Some(DgResult::Err(ref e)) = answer {
+                log_error(&format!("Deepgram failed: {}", e));
+            }
 
-            if let Some(text) = dg_text {
-                // Deepgram succeeded
-                if let Ok(mut clipboard) = Clipboard::new() {
-                    if clipboard.set_text(&text).is_ok() {
-                        paste_and_maybe_return();
+            match after_deepgram(answer) {
+                Next::Paste(text) => {
+                    if let Ok(mut clipboard) = Clipboard::new() {
+                        if clipboard.set_text(&text).is_ok() {
+                            paste_and_maybe_return();
+                        }
                     }
                 }
-            } else if let Some(ref key) = groq_key {
-                if !shadow_audio.is_empty() {
-                    // Fallback to Groq
-                    show_notification("Deepgram failed, using Groq fallback");
-                    log_error("Falling back to Groq Whisper");
-                    if let Some(text) = transcribe_groq(shadow_audio, sample_rate, key, &keywords) {
-                        if let Ok(mut clipboard) = Clipboard::new() {
-                            if clipboard.set_text(&text).is_ok() {
-                                paste_and_maybe_return();
+                Next::Nothing => {}
+                Next::Groq => {
+                    if let Some(ref key) = groq_key {
+                        if !shadow_audio.is_empty() {
+                            show_notification("Deepgram failed, using Groq fallback");
+                            log_error("Falling back to Groq Whisper");
+                            if let Some(text) = transcribe_groq(shadow_audio, sample_rate, key, &keywords) {
+                                if let Ok(mut clipboard) = Clipboard::new() {
+                                    if clipboard.set_text(&text).is_ok() {
+                                        paste_and_maybe_return();
+                                    }
+                                }
+                            } else {
+                                show_notification("Transcription failed (both backends)");
+                                log_error("Groq fallback also failed");
                             }
                         }
-                    } else {
-                        show_notification("Transcription failed (both backends)");
-                        log_error("Groq fallback also failed");
+                    } else if !shadow_audio.is_empty() {
+                        show_notification("Deepgram failed, no Groq key for fallback");
+                        log_error("Deepgram failed, no Groq key configured for fallback");
                     }
                 }
-            } else if !shadow_audio.is_empty() {
-                show_notification("Deepgram failed, no Groq key for fallback");
-                log_error("Deepgram failed, no Groq key configured for fallback");
             }
         });
     } else {
@@ -1211,5 +1218,13 @@ mod tests {
         assert!(!other_modifier_held(FN_KEY_FLAG | caps, FN_KEY_FLAG));
         assert!(!other_modifier_held(OPTION_KEY_FLAG, OPTION_KEY_FLAG));
         assert!(other_modifier_held(OPTION_KEY_FLAG | cmd, OPTION_KEY_FLAG));
+    }
+
+    #[test]
+    fn no_speech_never_reaches_groq() {
+        assert!(matches!(after_deepgram(Some(DgResult::Ok(String::new()))), Next::Nothing));
+        assert!(matches!(after_deepgram(Some(DgResult::Ok("hi".into()))), Next::Paste(t) if t == "hi"));
+        assert!(matches!(after_deepgram(Some(DgResult::Err("dropped".into()))), Next::Groq));
+        assert!(matches!(after_deepgram(None), Next::Groq));
     }
 }
