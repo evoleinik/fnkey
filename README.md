@@ -99,6 +99,7 @@ Note: If cargo isn't found, run with login shell: `/bin/bash -l -c './build-app.
 - **Auto-return mode** - Optional Return keypress after paste (toggle in menu bar)
 - **Ignores taps and shortcuts** - Presses under 0.3s and Fn used with another key (Fn+Delete, Fn+arrows) record nothing
 - **Paste while speaking (optional)** - Turn it on in the menu bar (○ → **Paste while speaking**). Each finished phrase pastes while Fn is still held. Off by default, saved as `~/.config/fnkey/live_paste`. Return (if on) is pressed once, at release. Once a phrase is pasted, the Groq fallback is skipped so nothing is pasted twice. Phrases already pasted stay if you then turn the press into a shortcut.
+- **Keeps your clipboard** - Whatever you had copied (text, images, files) comes back 0.5s after FnKey pastes. It is skipped if you copy something in the meantime, or if there was nothing readable to save, such as an expired copy from another device. A password marked concealed is never put back. Clipboard histories such as Alfred get one entry per dictation: live phrases and the restored item are marked transient (nspasteboard.org) so they are not recorded.
 - **No invented text** - When Deepgram hears no speech, nothing is pasted. Groq runs only when Deepgram can't answer, because Whisper turns silence into phrases like "Thank you for watching!"
 - **Diagnostics** - Deepgram problems go to `~/.config/fnkey/error.log` with the server, connect time and bytes sent
 

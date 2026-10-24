@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::ffi::c_void;
+use std::ffi::{c_void, CStr, CString};
 use std::io::Cursor;
 use std::io::Write as IoWrite;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use arboard::Clipboard;
 use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyAccessory, NSMenu};
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSAutoreleasePool, NSString};
@@ -35,7 +34,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 use hound::{WavSpec, WavWriter};
 use objc::declare::ClassDecl;
-use objc::runtime::{Class, Object, Sel};
+use objc::runtime::{Class, Object, Sel, BOOL};
 use objc::{class, msg_send, sel, sel_impl};
 use tungstenite::protocol::Message;
 
@@ -140,6 +139,15 @@ const OWN_EVENT_TAG: i64 = 0x464E_4B59;
 const OWNER_NONE: u8 = 0;
 const OWNER_LIVE: u8 = 1;
 const OWNER_GROQ: u8 = 2;
+
+/// Clipboard type for plain text
+const TEXT_TYPE: &str = "public.utf8-plain-text";
+/// nspasteboard.org markers. Clipboard histories such as Alfred skip transient items.
+/// Concealed marks a password, which FnKey never puts back.
+const TRANSIENT_TYPE: &str = "org.nspasteboard.TransientType";
+const CONCEALED_TYPE: &str = "org.nspasteboard.ConcealedType";
+/// How long FnKey's text stays on the clipboard before the old content goes back
+const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(500);
 
 /// Messages sent from audio callback / event tap to the WebSocket thread
 enum WsCommand {
@@ -286,8 +294,8 @@ enum DgResult {
 /// What to do once Deepgram has answered, or failed to
 enum Next {
     Paste(String),
-    /// The text was already pasted live: only the optional Return is left
-    ReturnOnly,
+    /// The text was already pasted live: the optional Return and one history entry are left
+    ReturnOnly(String),
     /// Deepgram heard no speech. Whisper on the same audio invents stock
     /// phrases like "Thank you for watching!", so nothing is pasted.
     /// Also used when live paste already put part of the text in the app.
@@ -300,7 +308,7 @@ enum Next {
 fn after_deepgram(answer: Option<DgResult>, live_pasted: bool) -> Next {
     match answer {
         Some(DgResult::Ok(text)) if text.is_empty() => Next::Nothing,
-        Some(DgResult::Ok(_)) if live_pasted => Next::ReturnOnly,
+        Some(DgResult::Ok(text)) if live_pasted => Next::ReturnOnly(text),
         Some(DgResult::Ok(text)) => Next::Paste(text),
         Some(DgResult::Err(_)) | None if live_pasted => Next::Nothing,
         Some(DgResult::Err(_)) | None => Next::Groq,
@@ -617,7 +625,7 @@ fn spawn_deepgram_thread(
             if let Some(lp) = live.as_mut() {
                 if let Some(text) = lp.take_due(Instant::now()) {
                     if stats.claim_live() {
-                        paste_text(&text);
+                        paste_text(&text, true);
                     }
                 }
             }
@@ -630,7 +638,7 @@ fn spawn_deepgram_thread(
         if let Some(lp) = live.as_mut() {
             if let Some(text) = lp.take_rest() {
                 if stats.claim_live() {
-                    paste_text(&text);
+                    paste_text(&text, true);
                 }
             }
         }
@@ -645,6 +653,7 @@ fn spawn_deepgram_thread(
                     "Deepgram text arrived after the {}s wait and {}: {}",
                     DEEPGRAM_WAIT.as_secs(), fate, stats.summary()
                 ));
+                restore_clipboard_later();
             }
         } else if let Some(err) = ws_error {
             let _ = result_tx.send(DgResult::Err(err));
@@ -886,6 +895,7 @@ fn stop_recording(state: &Arc<AppState>) {
         }
         state.dg_result_rx.lock().unwrap().take();
         state.dg_stats.lock().unwrap().take();
+        thread::spawn(restore_clipboard_later);
         return;
     }
 
@@ -952,23 +962,24 @@ fn stop_recording(state: &Arc<AppState>) {
             let live_pasted = stats.as_ref().map_or(false, |s| s.live_pasted());
             match after_deepgram(answer, live_pasted) {
                 Next::Paste(text) => {
-                    if paste_text(&text) {
+                    if paste_text(&text, false) {
                         maybe_return();
                     }
                 }
-                Next::ReturnOnly => maybe_return(),
+                Next::ReturnOnly(text) => {
+                    maybe_return();
+                    record_in_history(&text);
+                }
                 Next::Nothing => {}
+                // A live paste can land between the check above and here. The claim settles it.
+                Next::Groq if !stats.as_ref().map_or(true, |s| s.claim_groq()) => {}
                 Next::Groq => {
-                    // A live paste can land between the check above and here. The claim settles it.
-                    if !stats.as_ref().map_or(true, |s| s.claim_groq()) {
-                        return;
-                    }
                     if let Some(ref key) = groq_key {
                         if !shadow_audio.is_empty() {
                             show_notification("Deepgram failed, using Groq fallback");
                             log_error("Falling back to Groq Whisper");
                             if let Some(text) = transcribe_groq(shadow_audio, sample_rate, key, &keywords) {
-                                if paste_text(&text) {
+                                if paste_text(&text, false) {
                                     maybe_return();
                                 }
                             } else {
@@ -982,6 +993,7 @@ fn stop_recording(state: &Arc<AppState>) {
                     }
                 }
             }
+            restore_clipboard_later();
         });
     } else {
         // Groq-only mode (no Deepgram key configured)
@@ -991,11 +1003,12 @@ fn stop_recording(state: &Arc<AppState>) {
         thread::spawn(move || {
             if let Some(ref key) = groq_key {
                 if let Some(text) = transcribe_groq(shadow_audio, sample_rate, key, &keywords) {
-                    if paste_text(&text) {
+                    if paste_text(&text, false) {
                         maybe_return();
                     }
                 }
             }
+            restore_clipboard_later();
         });
     }
 }
@@ -1267,13 +1280,174 @@ fn press_return() {
         .output();
 }
 
-/// Puts text on the clipboard and sends Cmd+V. False if the clipboard refused it.
-fn paste_text(text: &str) -> bool {
-    let Ok(mut clipboard) = Clipboard::new() else { return false };
-    if clipboard.set_text(text).is_err() {
+/// Puts text on the clipboard and sends Cmd+V. The user's clipboard is saved first, once per
+/// press. Transient text (live phrases) stays out of clipboard histories. False if the write failed.
+fn paste_text(text: &str, transient: bool) -> bool {
+    let written = unsafe {
+        let pool = NSAutoreleasePool::new(nil);
+        let pb = general_pasteboard();
+        let mut saved = SAVED_CLIPBOARD.lock().unwrap();
+        let before = snapshot_for_paste(pb, saved.take());
+        let change = write_text(pb, text, transient);
+        *saved = Some(SavedClipboard { our_change: change, ..before });
+        let _: () = msg_send![pool, drain];
+        change >= 0
+    };
+    if written {
+        paste_with_cgevent();
+    }
+    written
+}
+
+/// After live paste, puts the whole dictation on the clipboard unmarked so a clipboard
+/// history records it once. Waits first so the app has read the last live phrase.
+fn record_in_history(text: &str) {
+    thread::sleep(PASTE_GAP);
+    unsafe {
+        let pool = NSAutoreleasePool::new(nil);
+        let pb = general_pasteboard();
+        let change = write_text(pb, text, false);
+        if let Some(saved) = SAVED_CLIPBOARD.lock().unwrap().as_mut() {
+            saved.our_change = change;
+        }
+        let _: () = msg_send![pool, drain];
+    }
+}
+
+/// Puts back what was on the clipboard before this press, once the app has read the paste
+fn restore_clipboard_later() {
+    if SAVED_CLIPBOARD.lock().unwrap().is_none() {
+        return;
+    }
+    thread::sleep(CLIPBOARD_RESTORE_DELAY);
+    let Some(saved) = SAVED_CLIPBOARD.lock().unwrap().take() else { return };
+    unsafe {
+        let pool = NSAutoreleasePool::new(nil);
+        restore_if_unchanged(general_pasteboard(), &saved);
+        let _: () = msg_send![pool, drain];
+    }
+}
+
+// ============================================================================
+// Clipboard save and restore (NSPasteboard, every item and every type)
+// ============================================================================
+
+/// Each clipboard item as (type, bytes) pairs, so text, images, files and rich text all survive
+type ClipItems = Vec<Vec<(String, Vec<u8>)>>;
+
+struct SavedClipboard {
+    items: ClipItems,
+    /// changeCount right after FnKey's last write. Anything else means the user copied since.
+    our_change: isize,
+}
+
+/// The user's clipboard from before the current press's first paste
+static SAVED_CLIPBOARD: Mutex<Option<SavedClipboard>> = Mutex::new(None);
+
+unsafe fn general_pasteboard() -> id {
+    msg_send![class!(NSPasteboard), generalPasteboard]
+}
+
+unsafe fn change_count(pb: id) -> isize {
+    msg_send![pb, changeCount]
+}
+
+unsafe fn ns_string(s: &str) -> id {
+    let c = CString::new(s).unwrap_or_default();
+    msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()]
+}
+
+unsafe fn rust_string(ns: id) -> String {
+    let p: *const std::os::raw::c_char = msg_send![ns, UTF8String];
+    if p.is_null() { String::new() } else { CStr::from_ptr(p).to_string_lossy().into_owned() }
+}
+
+unsafe fn ns_data(bytes: &[u8]) -> id {
+    msg_send![class!(NSData), dataWithBytes: bytes.as_ptr() as *const c_void length: bytes.len()]
+}
+
+unsafe fn data_bytes(data: id) -> Vec<u8> {
+    let len: usize = msg_send![data, length];
+    if len == 0 {
+        return Vec::new();
+    }
+    let p: *const u8 = msg_send![data, bytes];
+    std::slice::from_raw_parts(p, len).to_vec()
+}
+
+unsafe fn read_items(pb: id) -> ClipItems {
+    let items: id = msg_send![pb, pasteboardItems];
+    if items == nil {
+        return Vec::new();
+    }
+    let count: usize = msg_send![items, count];
+    (0..count)
+        .map(|i| {
+            let item: id = msg_send![items, objectAtIndex: i];
+            let types: id = msg_send![item, types];
+            let type_count: usize = msg_send![types, count];
+            (0..type_count)
+                .filter_map(|j| {
+                    let t: id = msg_send![types, objectAtIndex: j];
+                    let data: id = msg_send![item, dataForType: t];
+                    if data == nil { None } else { Some((rust_string(t), data_bytes(data))) }
+                })
+                .collect::<Vec<_>>()
+        })
+        // An item with no readable data (an expired remote copy, a file promise) cannot be put back
+        .filter(|entries: &Vec<(String, Vec<u8>)>| !entries.is_empty())
+        .collect()
+}
+
+/// Replaces the clipboard with these items and returns the new changeCount (-1 if refused)
+unsafe fn write_items(pb: id, items: &ClipItems, transient: bool) -> isize {
+    let _: isize = msg_send![pb, clearContents];
+    let array: id = msg_send![class!(NSMutableArray), array];
+    for entries in items {
+        let item: id = msg_send![class!(NSPasteboardItem), new];
+        for (t, bytes) in entries {
+            let _: BOOL = msg_send![item, setData: ns_data(bytes) forType: ns_string(t)];
+        }
+        if transient {
+            let _: BOOL = msg_send![item, setData: ns_data(&[]) forType: ns_string(TRANSIENT_TYPE)];
+        }
+        let _: () = msg_send![array, addObject: item];
+        let _: () = msg_send![item, release];
+    }
+    let ok: BOOL = msg_send![pb, writeObjects: array];
+    if ok == objc::runtime::NO && !items.is_empty() { -1 } else { change_count(pb) }
+}
+
+unsafe fn write_text(pb: id, text: &str, transient: bool) -> isize {
+    write_items(pb, &vec![vec![(TEXT_TYPE.to_string(), text.as_bytes().to_vec())]], transient)
+}
+
+/// The clipboard to put back after this paste. An earlier snapshot is kept only while FnKey made
+/// the last write, as between live phrases. Otherwise the clipboard is read fresh.
+unsafe fn snapshot_for_paste(pb: id, earlier: Option<SavedClipboard>) -> SavedClipboard {
+    match earlier {
+        Some(s) if s.our_change == change_count(pb) => s,
+        _ => SavedClipboard { items: read_items(pb), our_change: 0 },
+    }
+}
+
+/// A password is never put back on the clipboard
+fn is_concealed(items: &ClipItems) -> bool {
+    items.iter().flatten().any(|(t, _)| t == CONCEALED_TYPE)
+}
+
+/// Puts the saved items back, marked transient so a clipboard history does not record them twice.
+/// Skipped if anything was copied after FnKey's last write, if the saved item was a password, or if
+/// nothing readable was saved: FnKey never leaves the clipboard emptier than its own text.
+unsafe fn restore_if_unchanged(pb: id, saved: &SavedClipboard) -> bool {
+    if change_count(pb) != saved.our_change || is_concealed(&saved.items) || saved.items.is_empty() {
         return false;
     }
-    paste_with_cgevent();
+    if write_items(pb, &saved.items, true) < 0 {
+        let types: usize = saved.items.iter().map(|e| e.len()).sum();
+        log_error(&format!("Clipboard restore failed: {} items, {} types", saved.items.len(), types));
+        return false;
+    }
     true
 }
 
@@ -1380,7 +1554,7 @@ mod tests {
 
     #[test]
     fn live_text_is_never_pasted_twice() {
-        assert!(matches!(after_deepgram(Some(DgResult::Ok("hi".into())), true), Next::ReturnOnly));
+        assert!(matches!(after_deepgram(Some(DgResult::Ok("hi".into())), true), Next::ReturnOnly(t) if t == "hi"));
         assert!(matches!(after_deepgram(Some(DgResult::Err("dropped".into())), true), Next::Nothing));
         assert!(matches!(after_deepgram(None, true), Next::Nothing));
         assert!(matches!(after_deepgram(Some(DgResult::Ok(String::new())), true), Next::Nothing));
@@ -1409,5 +1583,121 @@ mod tests {
         assert_eq!(lp.take_due(t0 + Duration::from_millis(100)), None);
         lp.add("Fine.");
         assert_eq!(lp.take_due(t0 + PASTE_GAP).as_deref(), Some(" How are you? Fine."));
+    }
+
+    /// A private pasteboard, so tests never touch the user's clipboard
+    struct TestBoard(id);
+    impl TestBoard {
+        fn new() -> Self {
+            unsafe { TestBoard(msg_send![class!(NSPasteboard), pasteboardWithUniqueName]) }
+        }
+    }
+    impl Drop for TestBoard {
+        fn drop(&mut self) {
+            unsafe {
+                let _: () = msg_send![self.0, releaseGlobally];
+            }
+        }
+    }
+
+    fn without_marker(items: ClipItems) -> ClipItems {
+        items.into_iter().map(|e| e.into_iter().filter(|(t, _)| t != TRANSIENT_TYPE).collect()).collect()
+    }
+
+    fn has_marker(items: &ClipItems) -> bool {
+        !items.is_empty() && items.iter().all(|e| e.iter().any(|(t, _)| t == TRANSIENT_TYPE))
+    }
+
+    fn original() -> ClipItems {
+        vec![
+            vec![(TEXT_TYPE.to_string(), b"copied before".to_vec()), ("com.example.bin".to_string(), vec![0, 1, 2, 255])],
+            vec![(TEXT_TYPE.to_string(), b"second item".to_vec())],
+        ]
+    }
+
+    #[test]
+    fn clipboard_round_trip_keeps_every_item_and_type() {
+        unsafe {
+            let pb = TestBoard::new();
+            write_items(pb.0, &original(), false);
+            assert_eq!(read_items(pb.0), original());
+        }
+    }
+
+    #[test]
+    fn fnkey_text_is_marked_only_when_transient() {
+        unsafe {
+            let pb = TestBoard::new();
+            write_text(pb.0, "phrase", true);
+            assert!(has_marker(&read_items(pb.0)));
+            write_text(pb.0, "whole dictation", false);
+            assert!(!has_marker(&read_items(pb.0)));
+        }
+    }
+
+    #[test]
+    fn restore_brings_back_the_old_clipboard_marked_transient() {
+        unsafe {
+            let pb = TestBoard::new();
+            write_items(pb.0, &original(), false);
+            let items = read_items(pb.0);
+            let our_change = write_text(pb.0, "dictation", false);
+            assert!(restore_if_unchanged(pb.0, &SavedClipboard { items, our_change }));
+            let back = read_items(pb.0);
+            assert!(has_marker(&back), "a plain restore is recorded again by Alfred");
+            assert_eq!(without_marker(back), original());
+        }
+    }
+
+    #[test]
+    fn restore_skips_when_the_user_copied_since() {
+        unsafe {
+            let pb = TestBoard::new();
+            write_items(pb.0, &original(), false);
+            let items = read_items(pb.0);
+            let our_change = write_text(pb.0, "dictation", false);
+            write_text(pb.0, "user copied this", false);
+            assert!(!restore_if_unchanged(pb.0, &SavedClipboard { items, our_change }));
+            assert_eq!(read_items(pb.0)[0][0].1, b"user copied this".to_vec());
+        }
+    }
+
+    #[test]
+    fn a_stale_snapshot_is_replaced_by_what_the_user_copied() {
+        unsafe {
+            let pb = TestBoard::new();
+            write_items(pb.0, &original(), false);
+            let first = snapshot_for_paste(pb.0, None);
+            let our_change = write_text(pb.0, "phrase one", true);
+            let kept = snapshot_for_paste(pb.0, Some(SavedClipboard { items: first.items, our_change }));
+            assert_eq!(kept.items, original(), "between live phrases the first snapshot stays");
+            let our_change = write_text(pb.0, "dictation", false);
+            write_text(pb.0, "user copied this", false);
+            let fresh = snapshot_for_paste(pb.0, Some(SavedClipboard { items: kept.items, our_change }));
+            assert_eq!(fresh.items[0][0].1, b"user copied this".to_vec());
+        }
+    }
+
+    #[test]
+    fn an_empty_snapshot_never_empties_the_clipboard() {
+        unsafe {
+            let pb = TestBoard::new();
+            let our_change = write_text(pb.0, "dictation", false);
+            assert!(!restore_if_unchanged(pb.0, &SavedClipboard { items: Vec::new(), our_change }));
+            assert_eq!(read_items(pb.0)[0][0].1, b"dictation".to_vec());
+        }
+    }
+
+    #[test]
+    fn restore_never_puts_a_password_back() {
+        unsafe {
+            let pb = TestBoard::new();
+            let secret = vec![vec![(TEXT_TYPE.to_string(), b"hunter2".to_vec()), (CONCEALED_TYPE.to_string(), vec![])]];
+            write_items(pb.0, &secret, false);
+            let items = read_items(pb.0);
+            let our_change = write_text(pb.0, "dictation", false);
+            assert!(!restore_if_unchanged(pb.0, &SavedClipboard { items, our_change }));
+            assert_eq!(read_items(pb.0)[0][0].1, b"dictation".to_vec());
+        }
     }
 }
