@@ -1392,8 +1392,10 @@ unsafe fn read_items(pb: id) -> ClipItems {
                     let data: id = msg_send![item, dataForType: t];
                     if data == nil { None } else { Some((rust_string(t), data_bytes(data))) }
                 })
-                .collect()
+                .collect::<Vec<_>>()
         })
+        // An item with no readable data (an expired remote copy, a file promise) cannot be put back
+        .filter(|entries: &Vec<(String, Vec<u8>)>| !entries.is_empty())
         .collect()
 }
 
@@ -1435,12 +1437,17 @@ fn is_concealed(items: &ClipItems) -> bool {
 }
 
 /// Puts the saved items back, marked transient so a clipboard history does not record them twice.
-/// Skipped if anything was copied after FnKey's last write, or if the saved item was a password.
+/// Skipped if anything was copied after FnKey's last write, if the saved item was a password, or if
+/// nothing readable was saved: FnKey never leaves the clipboard emptier than its own text.
 unsafe fn restore_if_unchanged(pb: id, saved: &SavedClipboard) -> bool {
-    if change_count(pb) != saved.our_change || is_concealed(&saved.items) {
+    if change_count(pb) != saved.our_change || is_concealed(&saved.items) || saved.items.is_empty() {
         return false;
     }
-    write_items(pb, &saved.items, true);
+    if write_items(pb, &saved.items, true) < 0 {
+        let types: usize = saved.items.iter().map(|e| e.len()).sum();
+        log_error(&format!("Clipboard restore failed: {} items, {} types", saved.items.len(), types));
+        return false;
+    }
     true
 }
 
@@ -1668,6 +1675,16 @@ mod tests {
             write_text(pb.0, "user copied this", false);
             let fresh = snapshot_for_paste(pb.0, Some(SavedClipboard { items: kept.items, our_change }));
             assert_eq!(fresh.items[0][0].1, b"user copied this".to_vec());
+        }
+    }
+
+    #[test]
+    fn an_empty_snapshot_never_empties_the_clipboard() {
+        unsafe {
+            let pb = TestBoard::new();
+            let our_change = write_text(pb.0, "dictation", false);
+            assert!(!restore_if_unchanged(pb.0, &SavedClipboard { items: Vec::new(), our_change }));
+            assert_eq!(read_items(pb.0)[0][0].1, b"dictation".to_vec());
         }
     }
 
