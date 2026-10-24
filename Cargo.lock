@@ -409,7 +409,7 @@ checksum = "3a3076410a55c90011c298b04d0cfa770b00fa04e1e3c97d3f6c9de105a03844"
 
 [[package]]
 name = "fnkey"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "cocoa",
